@@ -122,7 +122,10 @@ export class SdkRoomRuntime implements ManagedRoomRuntime {
   private readonly limiter: DecisionConcurrencyLimiter;
   private readonly createRuntime: NonNullable<RoomRuntimeDependencies['createRuntime']>;
   private readonly sessions = new Map<string, AgentRuntimeHandle[]>();
+  private readonly attachedAgents = new Map<string, Set<string>>();
+  private readonly attachments = new Map<string, Promise<void>>();
   private readonly roomCredentials = new Map<string, Map<string, string>>();
+  private stopping = false;
 
   constructor(private readonly deps: RoomRuntimeDependencies) {
     this.limiter = new DecisionConcurrencyLimiter(deps.config.MAX_PROVIDER_CONCURRENCY);
@@ -131,22 +134,45 @@ export class SdkRoomRuntime implements ManagedRoomRuntime {
       ((config, dependencies) => new AgentRuntime(config, dependencies));
   }
 
-  async attach(room: ProductRoom): Promise<void> {
-    if (room.tableId === null || this.sessions.has(room.id)) return;
+  attach(room: ProductRoom): Promise<void> {
+    if (room.tableId === null || this.stopping) return Promise.resolve();
+    const existing = this.attachments.get(room.id);
+    if (existing !== undefined) return existing;
+    const work = this.attachMissing(room);
+    this.attachments.set(room.id, work);
+    void work.finally(() => {
+      if (this.attachments.get(room.id) === work) this.attachments.delete(room.id);
+    }).catch(() => undefined);
+    return work;
+  }
+
+  private async attachMissing(room: ProductRoom): Promise<void> {
     const participants = this.deps.store
       .listParticipants(room.id)
       .filter((participant) => participant.kind === 'AGENT' && participant.agentId !== null);
     if (participants.length === 0) return;
     const agentPrincipalIds = participants.map((participant) => participant.principalId);
-    const runtimes: AgentRuntimeHandle[] = [];
-    for (const participant of participants) {
-      const runtime = await this.startAgent(room, participant.agentId!, agentPrincipalIds);
-      if (runtime !== null) runtimes.push(runtime);
-    }
+    const runtimes = this.sessions.get(room.id) ?? [];
+    const attached = this.attachedAgents.get(room.id) ?? new Set<string>();
     this.sessions.set(room.id, runtimes);
+    this.attachedAgents.set(room.id, attached);
+    for (const participant of participants) {
+      if (this.stopping) break;
+      if (attached.has(participant.agentId!)) continue;
+      const runtime = await this.startAgent(room, participant.agentId!, agentPrincipalIds);
+      if (runtime === null) continue;
+      if (this.stopping) {
+        await runtime.stop().catch(() => undefined);
+        break;
+      }
+      runtimes.push(runtime);
+      attached.add(participant.agentId!);
+    }
   }
 
   async stop(): Promise<void> {
+    this.stopping = true;
+    await Promise.allSettled([...this.attachments.values()]);
     await Promise.all([...this.sessions.keys()].map((roomId) => this.stopRoom(roomId)));
   }
 
@@ -158,6 +184,7 @@ export class SdkRoomRuntime implements ManagedRoomRuntime {
   private async stopRoom(roomId: string): Promise<void> {
     const runtimes = this.sessions.get(roomId) ?? [];
     this.sessions.delete(roomId);
+    this.attachedAgents.delete(roomId);
     this.roomCredentials.delete(roomId);
     await Promise.all(runtimes.map((runtime) => runtime.stop().catch(() => undefined)));
   }
@@ -170,8 +197,10 @@ export class SdkRoomRuntime implements ManagedRoomRuntime {
    * Safe to call repeatedly.
    */
   async detach(roomId: string): Promise<void> {
+    await this.attachments.get(roomId)?.catch(() => undefined);
     const runtimes = this.sessions.get(roomId) ?? [];
     this.sessions.delete(roomId);
+    this.attachedAgents.delete(roomId);
     this.roomCredentials.delete(roomId);
     await Promise.all(
       runtimes.map(async (runtime) => {
@@ -229,6 +258,7 @@ export class SdkRoomRuntime implements ManagedRoomRuntime {
     agentPrincipalIds: readonly string[],
     options: { recordedOnly?: boolean } = {},
   ): Promise<AgentRuntimeHandle | null> {
+    if (this.stopping) return null;
     if (!this.deps.agents.has(agentId)) return null;
     const agent = this.deps.agents.get(agentId);
     const apiKey = process.env[agent.keyEnv];
@@ -245,6 +275,7 @@ export class SdkRoomRuntime implements ManagedRoomRuntime {
     // is missing, the runtime fails closed. Issued tokens are kept in memory
     // only and never persisted.
     const token = await this.roomToken(room, agentId);
+    if (this.stopping) return null;
     if (token === null) {
       this.deps.log({ event: 'runtime.credential_unavailable', detail: agentId });
       return null;

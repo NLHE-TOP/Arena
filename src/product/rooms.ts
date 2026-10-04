@@ -733,7 +733,10 @@ export class ProductRooms {
     }
     for (const room of this.store.listRooms('ACTIVE')) {
       try {
-        await this.attachRuntime(room);
+        await this.withRoomOperation(room.id, async () => {
+          const current = this.store.getRoom(room.id);
+          if (current?.status === 'ACTIVE') await this.attachRuntime(current);
+        });
         summary.attached += 1;
       } catch {
         summary.pending += 1;
@@ -746,7 +749,7 @@ export class ProductRooms {
     }
     for (const room of [...this.store.listRooms('COMPLETE'), ...this.store.listRooms('FAILED')]) {
       if (!this.hasPendingRecorded(room.id)) continue;
-      await this.recoverRecordedRuntime(room);
+      await this.reconcileRoom(room.id);
       if (!this.hasPendingRecorded(room.id)) summary.recovered += 1;
       else summary.pending += 1;
     }
@@ -1367,6 +1370,10 @@ export class ProductRooms {
           await this.settleAndRecord(room, competition);
           return 'COMPLETED';
         }
+        // Retry only missing clients after failed startup/auth/rejoin. The
+        // runtime coalesces attachment and preserves already-running agents;
+        // healthy agents incur no REST reads on this lifecycle cadence.
+        await this.attachRuntime(room);
         return 'PENDING';
       case 'CANCELLED':
         this.store.failRoom(room.id, 'PLATFORM_CANCELLED');

@@ -39,6 +39,12 @@ Explicit transitions do not wait for background cadence.
   seconds between completed passes; slow work never overlaps another pass.
 - Terminal rooms without pending durable work or a missing result: no polling.
 
+Runtime attachment is also single-flight per room. If startup authentication or
+socket connection fails for some agents, retain successful runtimes and retry
+only missing agents on ACTIVE recovery cadence. A healthy attachment performs
+no platform HTTP. Startup recovery shares the same room-operation boundary as
+explicit transitions and timer reconciliation.
+
 Before, ten agents alone generated 120 periodic observation reads/minute, plus
 one REST read for each socket-triggered resync. ACTIVE lifecycle polling added
 12 competition reads/minute/room. These are source-derived models, not measured
@@ -80,6 +86,20 @@ is not accurate for protected REST routes. The identity is nevertheless still
 IP-only, and early authentication rejection can bypass that route-level
 limiter. The intended correction explicitly places a coarse network hook before
 credential verification and a principal application hook after verification.
+
+The first real post-transport run (`2026-10-04T20-05-35-589Z-003e79`)
+completed 1H1A in 35.7 seconds with **one agent observation REST read**, 12 chat
+GETs, 12 agent action POSTs, and one competition GET. Including human-driver
+traffic: observation 16, chat 12, action 26, competition 1, other 15; rolling
+60-second tracked peak 70, with **zero authoritative platform 429s**.
+
+That run was **not** an all-scenario acceptance pass. Legacy IP limiting rejected
+agent 2 through 10 at 10A startup (27 `/auth/me` 429s: nine principals times three
+SDK attempts). This exposed partial-runtime attachment being cached forever;
+the bounded missing-agent recovery above fixes that NLHE transport-recovery
+defect without restarting healthy agents. The run then crashed in the new
+accounting proxy on an unhandled socket reset. Fault-injection-tested proxy
+hardening was required before repeating the complete accounting matrix.
 
 ## Acceptance status
 
