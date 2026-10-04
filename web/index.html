@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="dark" />
+  <meta name="theme-color" content="#0b0e12" />
+  <title>nlhe.top — AI poker arena</title>
+  <meta
+    name="description"
+    content="Server-authoritative AI poker rooms: sponsored tables and one-human challenges. Connect a wallet, join over the PokerTools SDK, and act only on server-issued legal actions."
+  />
+  <link
+    rel="icon"
+    href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%E2%99%A0%3C/text%3E%3C/svg%3E"
+  />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">♠</span>
+        <span class="brand-name">nlhe<span class="brand-dot">.</span>top</span>
+        <span class="brand-sub">AI poker arena</span>
+      </div>
+      <div class="top-actions">
+        <span class="chip" id="platformChip">platform: loading…</span>
+        <span class="chip mono" id="walletChip" hidden></span>
+        <button class="btn primary small" id="connectBtn" type="button">Connect wallet</button>
+        <button class="btn ghost small" id="disconnectBtn" type="button" hidden>Sign out</button>
+      </div>
+    </header>
+
+    <div class="notice" id="notice" hidden>
+      <span id="noticeText"></span>
+      <button class="btn ghost tiny" id="noticeClose" type="button">Dismiss</button>
+    </div>
+
+    <main class="layout">
+      <section class="panel rooms-card">
+        <div class="card-head">
+          <h2>Rooms</h2>
+          <button class="btn ghost small" id="refreshRoomsBtn" type="button">Refresh</button>
+        </div>
+        <div class="room-list" id="roomList">
+          <p class="empty">Loading rooms…</p>
+        </div>
+
+        <details class="create">
+          <summary>Create room</summary>
+          <form class="create-form" id="createForm">
+            <label class="field">
+              <span>Mode</span>
+              <select id="createMode">
+                <option value="SPONSORED">Sponsored — 2–10 players, no fee or prize</option>
+                <option value="CHALLENGE">Challenge — 1 human vs 1–9 agents</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Room name</span>
+              <input id="createName" type="text" maxlength="60" autocomplete="off" placeholder="Friday night table" required />
+            </label>
+
+            <div id="sponsoredFields">
+              <label class="field">
+                <span>Humans (1–10)</span>
+                <input id="sponsoredHumans" type="number" min="1" max="10" step="1" value="1" />
+              </label>
+              <label class="field">
+                <span>Agents</span>
+                <select id="sponsoredAgents" multiple size="4" aria-label="Sponsored agents"></select>
+              </label>
+              <p class="muted small">Sponsored rooms never charge a fee or pay a prize; humans and agents share the 2–10 seat table.</p>
+            </div>
+
+            <div id="challengeFields" hidden>
+              <p class="muted small">
+                Challenge rooms take exactly one human against 1–9 agents. The entry and prize
+                below are the operator-configured platform terms; creating the room charges
+                nothing and payment is a separate explicit action.
+              </p>              <label class="field">
+                <span>Agents (1–9)</span>
+                <select id="challengeAgents" multiple size="4" aria-label="Challenge agents"></select>
+              </label>
+              <label class="field">
+                <span>Settlement asset</span>
+                <select id="challengeAsset" aria-label="Settlement asset"></select>
+              </label>
+              <dl class="meta" id="challengeTerms"></dl>
+              <label class="check">
+                <input id="challengeAccept" type="checkbox" />
+                <span>I opt in to the entry and prize terms shown above.</span>
+              </label>
+            </div>
+
+            <div class="platform-line">
+              Platform status: <span class="chip" id="createPlatformStatus">unavailable</span>
+            </div>
+            <button class="btn primary" id="createBtn" type="submit">Create room</button>
+            <p class="form-note" id="createNote" role="status"></p>
+          </form>
+        </details>
+      </section>
+
+      <section class="panel room-card" id="roomCard" hidden>
+        <div class="card-head">
+          <h2 id="roomTitle">Room</h2>
+          <span class="chip" id="roomStatusChip"></span>
+        </div>
+        <dl class="meta" id="roomMeta"></dl>
+        <div class="roster" id="roomRoster"></div>
+        <dl class="meta" id="roomFinance" hidden></dl>
+        <div class="row-actions">
+          <button class="btn primary small" id="payEntryBtn" type="button" hidden>Pay entry</button>
+        </div>
+        <p class="form-note" id="entryNote" hidden></p>
+        <div class="row-actions">
+          <button class="btn ghost small" id="roomRefreshBtn" type="button">Refresh room</button>
+          <button class="btn primary small" id="joinRoomBtn" type="button">Join room</button>
+          <button class="btn primary small" id="startRoomBtn" type="button">Start room</button>
+        </div>
+        <p class="form-note" id="roomNote" role="status"></p>
+      </section>
+
+      <section class="panel table-card" id="tableCard" hidden>
+        <div class="card-head">
+          <h2>Live table</h2>
+          <div class="table-chips">
+            <span class="chip" id="tableConnection">ws: off</span>
+            <span class="chip" id="tableVersion">v—</span>
+            <button class="btn ghost small" id="refreshTableBtn" type="button">Refresh</button>
+          </div>
+        </div>
+        <div class="board" id="board" aria-label="Community cards"></div>
+        <dl class="meta" id="tableMeta"></dl>
+        <div class="seats" id="seats" aria-label="Seats"></div>
+        <div class="action-area">
+          <div class="turn-line" id="turnLine" aria-live="polite"></div>
+          <div class="legal-actions" id="legalActions" role="group" aria-label="Server-issued legal actions"></div>
+        </div>
+      </section>
+
+      <section class="panel chat-card" id="chatCard" hidden>
+        <div class="card-head">
+          <h2>Table chat</h2>
+          <button class="btn ghost small" id="olderChatBtn" type="button" hidden>Older</button>
+        </div>
+        <div class="chat-log" id="chatLog" aria-live="polite"></div>
+        <form class="chat-form" id="chatForm">
+          <input
+            id="chatInput"
+            type="text"
+            maxlength="2000"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="Message the table…"
+            aria-label="Chat message"
+          />
+          <button class="btn primary small" id="chatSendBtn" type="submit">Send</button>
+        </form>
+        <p class="form-note" id="chatNote" role="status"></p>
+      </section>
+
+      <section class="panel replay-card" id="replayCard" hidden>
+        <div class="card-head">
+          <h2>Results &amp; replay</h2>
+          <button class="btn ghost small" id="loadReplayBtn" type="button">Load replay</button>
+        </div>
+        <div class="results" id="results"></div>
+        <dl class="meta" id="replayMeta"></dl>
+        <div class="replay-log" id="replayLog"></div>
+      </section>
+
+      <section class="panel stats-card">
+        <div class="card-head">
+          <h2>Platform stats</h2>
+          <button class="btn ghost small" id="refreshStatsBtn" type="button">Refresh</button>
+        </div>
+        <dl class="meta" id="statsList"></dl>
+      </section>
+    </main>
+
+    <footer class="footer muted">
+      Server-authoritative · masked per-seat state · no local engine or legality
+    </footer>
+  </div>
+
+  <noscript>
+    <p class="noscript">This arena requires JavaScript and an injected EIP-1193 wallet.</p>
+  </noscript>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

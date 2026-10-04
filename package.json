@@ -1,0 +1,48 @@
+{
+  "name": "nlhe-top",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "dev": "tsx src/main.ts",
+    "start": "node dist/main.js",
+    "build": "node scripts/clean-build.mjs && tsc -p tsconfig.json && vite build",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.web.json --noEmit",
+    "test": "vitest run tests/product --maxWorkers=2",
+    "test:coverage": "vitest run tests/product --coverage --maxWorkers=2",
+    "lint": "eslint src web tests/product scripts --max-warnings=0",
+    "check:boundaries": "node scripts/check-boundaries.mjs",
+    "check:secrets": "node scripts/scan-secrets.mjs",
+    "test:integration": "tsx tests/integration/run.ts",
+    "test:live": "NLHE_LIVE_ENABLED=1 tsx tests/integration/live.ts"
+  },
+  "dependencies": {
+    "@fastify/rate-limit": "11.2.0",
+    "@fastify/static": "10.1.5",
+    "@pokertools/sdk": "2.0.0",
+    "@pokertools/types": "2.0.0",
+    "better-sqlite3": "13.0.3",
+    "fastify": "5.12.5",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "9.6.0",
+    "@types/node": "24.19.1",
+    "@vitest/coverage-v8": "5.0.3",
+    "eslint": "10.11.0",
+    "playwright": "1.63.0",
+    "tsx": "4.23.15",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.71.0",
+    "viem": "2.57.2",
+    "vite": "8.3.2",
+    "vitest": "5.0.3"
+  },
+  "allowScripts": {
+    "better-sqlite3@13.0.3": true,
+    "esbuild@0.28.2": true,
+    "esbuild@0.27.2": true,
+    "fsevents@2.3.3": false
+  }
+}

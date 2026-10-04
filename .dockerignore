@@ -1,0 +1,35 @@
+.env
+.env.*
+!.env.example
+node_modules
+**/node_modules
+**/coverage
+pokertools-arena
+.git
+.gitignore
+Dockerfile
+.dockerignore
+
+# Root-level build outputs and local state.
+/dist
+/exports
+/data
+/backups
+/restore
+/coverage
+/tests/artifacts
+*.sqlite*
+*.db*
+*.log
+.DS_Store
+._*
+.idea
+.vscode
+*.swp
+*.swo
+*~
+anvil-state*
+dump.json
+
+# The integration platform checkout is never part of the product image.
+/pokertools

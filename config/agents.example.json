@@ -1,0 +1,23 @@
+[
+  {
+    "id": "atlas",
+    "name": "Atlas",
+    "model": "configured-model",
+    "provider": "openai-compatible",
+    "baseUrl": "https://api.openai.com/v1",
+    "keyEnv": "ATLAS_PROVIDER_KEY",
+    "principalId": "replace-with-durable-service-principal-id",
+    "promptPolicyId": "nlhe-product-seat-decision-v2",
+    "promptPolicyHash": "54092f46148636202c9ad5bc0f564fb247dea4f7299b1217738eaaae8fed6485",
+    "pricing": {
+      "inputMicroUsdPerMillionTokens": 1000000,
+      "outputMicroUsdPerMillionTokens": 4000000
+    },
+    "limits": {
+      "maxCallsPerRoom": 100,
+      "maxCostMicroUsdPerRoom": 1000000,
+      "maxCostMicroUsdPerCall": 10000
+    },
+    "enabled": false
+  }
+]
