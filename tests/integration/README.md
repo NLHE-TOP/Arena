@@ -175,12 +175,22 @@ the external deployment's built operator fixture module (`.js`/`.mjs`). It must
 export `startFinancialTopology(input)` satisfying `FinancialTopology` in
 `infra/anvil-finance.ts`: real Anvil transfers/public deposit claims, balanced
 sponsor classification, ledger reads, real custody start and readiness polling.
+Its optional `restartApi()` operator hook is forwarded to the test platform
+handle for deposit-verifier isolation; it never restarts NLHE or imports platform
+internals into the product. NLHE does not ship this platform-owned fixture.
 The operator fixture must configure the external deployment's sponsor
 allowlist/identity and asset registry for the supplied sponsor before paid
 admission (including any operator-owned service restart that this needs).
 Standard public Anvil accounts are used (never fund them with value).
 NLHE contains no custody or ledger implementation. Missing fixtures fail the
 financial run; they are never replaced with mocks or a skipped acceptance.
+
+The sponsor operation must use the platform's own operator ledger mechanism:
+exactly two opposite postings from the sponsor's `USER_AVAILABLE` to that same
+sponsor's `OPERATOR`, under one durable request identity. Acceptance must verify
+a duplicate invocation leaves balances unchanged, the journal is balanced and
+sealed exactly once, and the principal's total is unchanged. Payer balances
+come only from real treasury transfers and public `claimDeposit`.
 
 ## Environment knobs
 

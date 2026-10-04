@@ -42,6 +42,8 @@ export interface ProductRoomRunInput {
   } | null;
   /** Hook after the room is ACTIVE and before completion waiting. */
   onActive?: (room: ProductRoomView) => Promise<void>;
+  /** Evidence hook called only after a human canonical SDK action succeeds. */
+  onHumanAction?: (observation: SeatObservation) => void;
   /**
    * Mixed-audit rooms: drive human seats passively (CHECK/CALL/FOLD only)
    * until the loopback provider has served this many requests for the table,
@@ -225,6 +227,7 @@ export async function runProductRoom(input: ProductRoomRunInput): Promise<Produc
       humans,
       tableId,
       isTerminal: () => terminal,
+      onAction: input.onHumanAction,
       isPassive: () => {
         const intro = input.passiveHumanIntro ?? null;
         return intro !== null && fakeProvider.requestCountForTable(tableId) < intro.untilProviderRequests;

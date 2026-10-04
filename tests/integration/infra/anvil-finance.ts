@@ -29,6 +29,8 @@ export interface FinancialTopology {
   readPrincipalAccounts(principalId: string): Promise<{ available: bigint; operator: bigint }>;
   /** Poll real platform custody/reconciliation readiness; never seed READY. */
   waitForReady(timeoutMs?: number): Promise<void>;
+  /** Operator-owned API restart for deposit verifier isolation. */
+  restartApi?: () => Promise<void>;
   stop(): Promise<void>;
 }
 

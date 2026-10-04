@@ -56,6 +56,7 @@ export async function startEnvironment(
         platformBaseUrl: platform.baseUrl,
         sponsor: { principalId: options.financial.sponsorPrincipalId, address: options.financial.sponsorAddress },
       });
+      platform.restartApi = financial.restartApi;
     }
     fakeProvider = await startFakeProvider();
     const provider = fakeProvider;

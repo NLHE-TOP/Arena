@@ -553,10 +553,13 @@ async function runRoomProve(): Promise<Report> {
     const surface = await probeProductSurface(nlhe.baseUrl);
     await report.check('room-prove: product surface ready', async () => {
       if (!surfaceReady(surface)) throw new Error(describeSurface(surface));
+      const ready = await fetch(`${nlhe!.baseUrl}/ready`);
+      if (!ready.ok) throw new Error(`product /ready HTTP ${ready.status}`);
     });
     const humans = [await loginWallet(environment.platform.baseUrl, ephemeralWallet())];
     const spec = ROSTER_MATRIX.find((candidate) => candidate.label === '1H1A')!;
     await report.check('room-prove: product-orchestrated 1H1A room completes with clean evidence', async () => {
+      let acceptedHumanActions = 0;
       const result = await runProductRoom({
         spec,
         context,
@@ -568,7 +571,18 @@ async function runRoomProve(): Promise<Report> {
         fakeProvider: environment.fakeProvider,
         productDatabasePath: databasePath,
         maxWaitMs: 10 * 60 * 1000,
+        onHumanAction: () => { acceptedHumanActions += 1; },
       });
+      if (acceptedHumanActions === 0) throw new Error('no accepted human canonical action');
+      if (!result.evidence.decisions.some(decision => decision.status === 'COMMITTED' && decision.receipt_json !== null)) {
+        throw new Error('no accepted deterministic-provider agent canonical action');
+      }
+      const { CompetitionClient } = await import('@pokertools/sdk');
+      const competitions = new CompetitionClient({ baseUrl: environment.platform.baseUrl, token: orchestrator.token });
+      const platformRoom = await competitions.getCompetition(result.room.pokerCompetitionId!);
+      if (platformRoom.tableId !== result.tableId || !platformRoom.settlementReady) {
+        throw new Error('product completion disagrees with authoritative platform state');
+      }
       if (result.evidence.decisions.length === 0) throw new Error('no durable agent decisions were recorded');
       if (result.providerRequests !== result.persistedAttempts) {
         throw new Error(
