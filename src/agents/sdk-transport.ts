@@ -3,9 +3,8 @@
  *
  * Composes the standard `PokerClient` and `PokerSocket`:
  * - REST (`getObservation`, `action`, `getChat`, `sendChat`, `getPrincipal`)
- *   is the only observation and action authority;
- * - socket `observation` messages are forwarded purely as resync triggers and
- *   are never treated as a local decision boundary;
+ *   provides recovery observations and canonical action submission;
+ * - socket `observation` messages carry the authoritative decision boundary;
  * - the bearer token is held only by the SDK clients and never logged.
  */
 import { PokerClient, PokerSocket } from '@pokertools/sdk';
@@ -25,7 +24,7 @@ export interface SdkAgentTransportOptions {
   wsUrl?: string;
   /** Per-request SDK timeout; defaults to 15000 ms. */
   timeoutMs?: number;
-  /** Connect the realtime socket for resync triggers; default true. */
+  /** Connect the realtime socket for canonical observations; default true. */
   connectSocket?: boolean;
   /** Injectable WebSocket constructor (tests); defaults to the global one. */
   WebSocket?: typeof WebSocket;
@@ -41,6 +40,7 @@ export class SdkAgentTransport implements AgentTurnTransport {
   >();
   private principal: Principal | null = null;
   private closed = false;
+  private readonly recoveryListeners = new Set<() => void>();
 
   constructor(options: SdkAgentTransportOptions) {
     this.client = new PokerClient({
@@ -72,10 +72,19 @@ export class SdkAgentTransport implements AgentTurnTransport {
       if (listeners === undefined) return;
       for (const listener of listeners) listener(observation);
     });
+    this.socket.on('connect', () => {
+      for (const listener of this.recoveryListeners) listener();
+    });
+    this.socket.on('disconnect', () => {
+      if (!this.closed) this.notifyRecovery();
+    });
+    this.socket.on('error', () => {
+      if (!this.closed) this.notifyRecovery();
+    });
     await this.socket.connect();
     for (const tableId of this.wantedTables) {
       void this.socket.join(tableId).catch(() => {
-        // Trigger joins are best effort; REST resync remains the authority.
+        this.notifyRecovery();
       });
     }
   }
@@ -128,7 +137,7 @@ export class SdkAgentTransport implements AgentTurnTransport {
     this.wantedTables.add(tableId);
     if (this.socket !== null && this.socket.isConnected()) {
       void this.socket.join(tableId).catch(() => {
-        // Best effort; the runtime resyncs over REST regardless.
+        this.notifyRecovery();
       });
     }
     return () => {
@@ -140,5 +149,14 @@ export class SdkAgentTransport implements AgentTurnTransport {
         if (!this.closed) this.socket?.leave(tableId);
       }
     };
+  }
+
+  onRecovery(listener: () => void): () => void {
+    this.recoveryListeners.add(listener);
+    return () => { this.recoveryListeners.delete(listener); };
+  }
+
+  private notifyRecovery(): void {
+    for (const listener of this.recoveryListeners) listener();
   }
 }

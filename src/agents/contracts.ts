@@ -133,10 +133,11 @@ export interface AgentTurnTransport {
     requestId: string;
   }): Promise<AgentChatReceipt>;
   /**
-   * Trigger subscription. Payloads are never decision authority; runtimes
-   * coalesce them and then resync through `fetchObservation`.
+   * Exact server-issued masked decision boundary (also authoritative over WS).
    */
   onObservation(tableId: string, listener: (observation: SeatObservation) => void): () => void;
+  /** Reconnect/rejoin failure or otherwise uncertain subscription state. */
+  onRecovery?(listener: () => void): () => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -325,7 +326,7 @@ export interface AgentRuntimeConfig {
   providerCallsEnabled?: boolean;
   /** Optional public speech, only after an accepted receipt; default OFF. */
   speech?: AgentSpeechPolicy;
-  /** Periodic REST resync interval; socket events only trigger resyncs. */
+  /** Inactivity safety watchdog (default 5 minutes); WS delivery resets it. */
   socketResyncIntervalMs?: number;
   /** Chat selection bounds shared by the store source and provider prompt. */
   chatSelection?: ChatSelectionOptions;

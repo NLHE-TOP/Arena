@@ -375,6 +375,10 @@ export class ProductRooms {
   private readonly log: (event: { event: string; detail?: string }) => void;
   private readonly challenge: ChallengeTermsConfig | null;
   private readonly seats = new Map<string, Map<string, number>>();
+  private reconciliation: Promise<Record<ReconcileOutcome, number>> | null = null;
+  private readonly roomOperations = new Map<string, Promise<unknown>>();
+  private readonly roomReconciliations = new Map<string, Promise<ReconcileOutcome>>();
+  private readonly nextReconciliationAt = new Map<string, number>();
   private platformStatus: PlatformStatusView = {
     status: 'UNKNOWN',
     reason: null,
@@ -641,6 +645,10 @@ export class ProductRooms {
    * Provisioning is idempotent through stable room-derived keys.
    */
   async start(roomId: string, actor: RoomActor): Promise<RoomView> {
+    return this.withRoomOperation(roomId, () => this.startRoom(roomId, actor));
+  }
+
+  private async startRoom(roomId: string, actor: RoomActor): Promise<RoomView> {
     let room = this.requireRoom(roomId);
     if (room.status === 'COMPLETE') return this.roomView(room);
     if (room.status === 'FAILED') {
@@ -677,6 +685,10 @@ export class ProductRooms {
 
   /** Creator/operator recovery path. No readiness gate blocks risk-reducing cancellation. */
   async cancel(roomId: string, actor: RoomActor): Promise<RoomView> {
+    return this.withRoomOperation(roomId, () => this.cancelRoom(roomId, actor));
+  }
+
+  private async cancelRoom(roomId: string, actor: RoomActor): Promise<RoomView> {
     const room = this.requireRoom(roomId);
     const participants = this.participants(roomId);
     this.assertStartAuthorized(room, participants, actor);
@@ -742,7 +754,17 @@ export class ProductRooms {
   }
 
   /** Reconcile every non-terminal room once; safe to call on a timer. */
-  async reconcileAll(): Promise<Record<ReconcileOutcome, number>> {
+  reconcileAll(): Promise<Record<ReconcileOutcome, number>> {
+    if (this.reconciliation !== null) return this.reconciliation;
+    const pass = this.reconcileDueRooms();
+    this.reconciliation = pass;
+    void pass.finally(() => {
+      if (this.reconciliation === pass) this.reconciliation = null;
+    }).catch(() => undefined);
+    return pass;
+  }
+
+  private async reconcileDueRooms(): Promise<Record<ReconcileOutcome, number>> {
     const counts: Record<ReconcileOutcome, number> = {
       SKIPPED: 0,
       PENDING: 0,
@@ -751,7 +773,13 @@ export class ProductRooms {
       FAILED: 0,
     };
     for (const room of this.store.listRooms()) {
-      if (room.status === 'DRAFT' || room.status === 'WAITING_FOR_ROSTER') {
+      // A late durable receipt/response may appear after a terminal detach
+      // failure. Re-enable recovery from local evidence, not platform polling.
+      if (this.nextReconciliationAt.get(room.id) === Infinity && this.hasPendingRecorded(room.id)) {
+        this.nextReconciliationAt.delete(room.id);
+      }
+      if (room.status === 'DRAFT' || room.status === 'WAITING_FOR_ROSTER' ||
+          Date.now() < (this.nextReconciliationAt.get(room.id) ?? 0)) {
         counts.SKIPPED += 1;
         continue;
       }
@@ -773,7 +801,46 @@ export class ProductRooms {
    * - a fully complete immutable room with no pending trace is SKIPPED before
    *   any platform read, so periodic reconciliation never polls history.
    */
-  async reconcileRoom(roomId: string): Promise<ReconcileOutcome> {
+  reconcileRoom(roomId: string): Promise<ReconcileOutcome> {
+    const existing = this.roomReconciliations.get(roomId);
+    if (existing !== undefined) return existing;
+    const work = this.withRoomOperation(roomId, () => this.reconcileRoomOnce(roomId));
+    this.roomReconciliations.set(roomId, work);
+    void work.finally(() => {
+      this.roomReconciliations.delete(roomId);
+      this.setReconciliationCadence(roomId);
+    }).catch(() => undefined);
+    return work;
+  }
+
+  /** Serialize explicit transitions with recovery; never read an equivalent
+   * competition concurrently from start/cancel and background reconciliation. */
+  private withRoomOperation<T>(roomId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.roomOperations.get(roomId) ?? Promise.resolve();
+    const work = previous.catch(() => undefined).then(operation);
+    this.roomOperations.set(roomId, work);
+    void work.finally(() => {
+      if (this.roomOperations.get(roomId) === work) this.roomOperations.delete(roomId);
+      this.setReconciliationCadence(roomId);
+    }).catch(() => undefined);
+    return work;
+  }
+
+  private setReconciliationCadence(roomId: string): void {
+    const room = this.store.getRoom(roomId);
+    if (room === null) { this.nextReconciliationAt.delete(roomId); return; }
+    // ACTIVE: <=2 lifecycle reads/min/room, with <=30s settlement projection
+    // latency. Provisioning/cancellation: <=12 recovery passes/min. Terminal
+    // history never polls; only genuinely pending durable work is retried.
+    const terminal = room.status === 'COMPLETE' || room.status === 'FAILED';
+    const pendingTerminal = terminal && (this.hasPendingRecorded(roomId) ||
+      (room.status === 'COMPLETE' && this.store.getRoomResult(roomId) === null));
+    const delay = terminal && !pendingTerminal ? Infinity :
+      room.status === 'ACTIVE' && !this.store.roomCancellationRequested(roomId) ? 30_000 : 5_000;
+    this.nextReconciliationAt.set(roomId, Date.now() + delay);
+  }
+
+  private async reconcileRoomOnce(roomId: string): Promise<ReconcileOutcome> {
     const room = this.store.getRoom(roomId);
     if (room === null) return 'SKIPPED';
     try {

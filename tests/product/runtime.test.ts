@@ -12,7 +12,7 @@ import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { Config } from '../../src/config.js';
 import { SdkRoomRuntime, type RoomRuntimeDependencies } from '../../src/agents/rooms.js';
 import {
@@ -525,6 +525,7 @@ class FakeTransport implements AgentTurnTransport {
   tableObservations = new Map<string, SeatObservation>();
   observationError: Error | null = null;
   fetchObservationCalls = 0;
+  fetchChatCalls = 0;
   private readonly fetchWaiters: Array<{ count: number; resolve: () => void }> = [];
   chat: ChatMessage[] = [];
   chatError: Error | null = null;
@@ -534,6 +535,9 @@ class FakeTransport implements AgentTurnTransport {
   sentChats: Array<{ tableId: string; body: string; requestId: string }> = [];
   chatSendError: Error | null = null;
   private readonly listeners = new Map<string, Set<(observation: SeatObservation) => void>>();
+  private readonly recoveryListeners = new Set<() => void>();
+  /** When false, models a transport whose join snapshot has not arrived yet. */
+  snapshotOnSubscribe = true;
 
   async connect(): Promise<void> {
     this.principalId = this.connectPrincipal;
@@ -567,6 +571,7 @@ class FakeTransport implements AgentTurnTransport {
   }
 
   async fetchChat(): Promise<readonly unknown[]> {
+    this.fetchChatCalls += 1;
     if (this.chatError !== null) throw this.chatError;
     return this.chat;
   }
@@ -584,11 +589,37 @@ class FakeTransport implements AgentTurnTransport {
       this.listeners.set(_tableId, set);
     }
     set.add(listener);
+    // Model the platform join snapshot: subscribing over the authenticated
+    // socket immediately delivers the current canonical observation. The
+    // runtime's direct WS path depends on this and never needs a REST fetch.
+    if (this.snapshotOnSubscribe) {
+      const snapshot = this.tableObservations.get(_tableId) ?? this.observation;
+      listener(snapshot);
+    }
     return () => set.delete(listener);
+  }
+
+  onRecovery(listener: () => void): () => void {
+    this.recoveryListeners.add(listener);
+    return () => this.recoveryListeners.delete(listener);
   }
 
   emitObservation(tableId: string, observation?: SeatObservation): void {
     for (const listener of this.listeners.get(tableId) ?? []) listener(observation ?? this.observation);
+  }
+
+  emitRecovery(): void {
+    for (const listener of [...this.recoveryListeners]) listener();
+  }
+
+  get recoveryListenerCount(): number {
+    return this.recoveryListeners.size;
+  }
+
+  /** Replace the authoritative table snapshot and deliver it over the socket. */
+  publishObservation(observation: SeatObservation): void {
+    this.observation = observation;
+    this.emitObservation(observation.tableId, observation);
   }
 }
 
@@ -907,6 +938,35 @@ function hasAudit(audits: AgentAuditEvent[], code: string): boolean {
   return audits.some((event) => event.code === code);
 }
 
+/**
+ * Deterministic latched wait over the runtime's microtask-only pipeline. No
+ * timers, sleeps or polling intervals are involved: the fake transport and
+ * fake provider resolve synchronously, so the durable state is reachable
+ * within a bounded number of microtask turns.
+ */
+async function waitUntil(predicate: () => boolean, what: string): Promise<void> {
+  for (let attempt = 0; attempt < 5_000; attempt += 1) {
+    if (predicate()) return;
+    await Promise.resolve();
+  }
+  throw new Error(`timed out waiting for ${what}`);
+}
+
+/** Drain a bounded number of microtask turns (no timers involved). */
+async function flushMicrotasks(): Promise<void> {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    await Promise.resolve();
+  }
+}
+
+function decisionFor(
+  store: MemoryDecisionStore,
+  tableId: string,
+  turnId: string,
+): ProductDecision | null {
+  return store.getDecisionForTurn(tableId, turnId, PRINCIPAL);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1006,7 +1066,7 @@ describe('AgentRuntime lifecycle', () => {
 });
 
 describe('AgentRuntime observation authority', () => {
-  it('rejects an observation that is not seat-scoped before any provider call', async () => {
+  it('drops a non-seat-scoped observation before any provider call and audits the recovery mismatch', async () => {
     const harness = makeHarness();
     harness.transport.observation = observationWith({ viewingPlayerId: null });
     await harness.runtime.start();
@@ -1017,7 +1077,7 @@ describe('AgentRuntime observation authority', () => {
     expect(hasAudit(harness.audits, 'OBSERVATION_IDENTITY_MISMATCH')).toBe(true);
   });
 
-  it('rejects an observation naming another player than the configured seat', async () => {
+  it('drops an observation naming another player than the configured seat', async () => {
     const harness = makeHarness({
       config: {
         rooms: [
@@ -1491,12 +1551,17 @@ describe('AgentRuntime room guards', () => {
     await harness.runtime.start();
     expect(expectStatus(harness.store, TEST_TABLE_ID, TEST_TURN_ID).status).toBe('COMMITTED');
 
-    harness.transport.observation = observationWith({
-      turnId: 'turn-2',
-      version: 5,
-      eventSeq: 11,
-    });
-    await harness.runtime.syncNow();
+    harness.transport.publishObservation(
+      observationWith({
+        turnId: 'turn-2',
+        version: 5,
+        eventSeq: 11,
+      }),
+    );
+    await waitUntil(
+      () => decisionFor(harness.store, TEST_TABLE_ID, 'turn-2')?.status === 'FAILED',
+      'room reservation denial',
+    );
 
     const second = expectStatus(harness.store, TEST_TABLE_ID, 'turn-2');
     expect(second.status).toBe('FAILED');
@@ -1517,14 +1582,19 @@ describe('AgentRuntime room guards', () => {
     await harness.runtime.start();
     expect(expectStatus(harness.store, TEST_TABLE_ID, TEST_TURN_ID).status).toBe('COMMITTED');
 
-    harness.transport.observation = observationWith({
-      handId: 'hand-2',
-      turnId: 'turn-2',
-      version: 5,
-      eventSeq: 11,
-      handNumber: 2,
-    });
-    await harness.runtime.syncNow();
+    harness.transport.publishObservation(
+      observationWith({
+        handId: 'hand-2',
+        turnId: 'turn-2',
+        version: 5,
+        eventSeq: 11,
+        handNumber: 2,
+      }),
+    );
+    await waitUntil(
+      () => decisionFor(harness.store, TEST_TABLE_ID, 'turn-2')?.status === 'FAILED',
+      'room hand cap denial',
+    );
 
     const second = expectStatus(harness.store, TEST_TABLE_ID, 'turn-2');
     expect(second.status).toBe('FAILED');
@@ -1630,9 +1700,13 @@ describe('AgentRuntime cost admission', () => {
     await harness.runtime.start();
     expect(expectStatus(harness.store, TEST_TABLE_ID, TEST_TURN_ID).status).toBe('COMMITTED');
 
-    harness.transport.observation = observationWith({ turnId: 'turn-2', version: 5, eventSeq: 11 });
-    await harness.runtime.syncNow();
-    expect(expectStatus(harness.store, TEST_TABLE_ID, 'turn-2').status).toBe('COMMITTED');
+    harness.transport.publishObservation(
+      observationWith({ turnId: 'turn-2', version: 5, eventSeq: 11 }),
+    );
+    await waitUntil(
+      () => decisionFor(harness.store, TEST_TABLE_ID, 'turn-2')?.status === 'COMMITTED',
+      'second billable call',
+    );
     expect(harness.provider.invocations).toBe(2);
 
     const reservation = harness.store.reservations.get(`${ROOM_ID}\0${AGENT_ID}`);
@@ -1671,25 +1745,404 @@ describe('AgentRuntime cost admission', () => {
   });
 });
 
-describe('AgentRuntime socket triggers and authority', () => {
-  it('coalesces socket observations into one REST resync and ignores their payload', async () => {
+describe('AgentRuntime canonical WS observations', () => {
+  it('consumes the exact socket observation directly without any additional REST recovery', async () => {
+    const harness = makeHarness();
+    harness.transport.observation = observationWith({ legalActions: [] });
+    await harness.runtime.start();
+    // The canonical join snapshot already arrived over WS, so startup does not
+    // fall back to REST at all.
+    const afterStart = harness.transport.fetchObservationCalls;
+    expect(afterStart).toBe(0);
+    expect(harness.provider.invocations).toBe(0);
+
+    const direct = observationWith({ turnId: 'turn-ws', version: 5, eventSeq: 11 });
+    harness.transport.emitObservation(TEST_TABLE_ID, direct);
+    await waitUntil(
+      () => decisionFor(harness.store, TEST_TABLE_ID, 'turn-ws')?.status === 'COMMITTED',
+      'direct WS decision',
+    );
+
+    // The WS boundary itself never triggers a REST recovery read, and the
+    // durable boundary is exactly the object received over the socket.
+    expect(harness.transport.fetchObservationCalls).toBe(afterStart);
+    expect(harness.transport.fetchChatCalls).toBe(1);
+    expect(harness.provider.invocations).toBe(1);
+    expect(harness.transport.actionRequests).toHaveLength(1);
+    const decision = decisionFor(harness.store, TEST_TABLE_ID, 'turn-ws')!;
+    expect(decision.observationHash).toBe(computeObservationHash(direct));
+    expect(decision.observation.turnId).toBe('turn-ws');
+    expect(decision.observation.version).toBe(5);
+  });
+
+  it('performs the startup REST recovery when the socket has not delivered a snapshot', async () => {
+    const harness = makeHarness();
+    harness.transport.snapshotOnSubscribe = false;
+    harness.transport.observation = observationWith({ legalActions: [] });
+    await harness.runtime.start();
+    // No canonical WS boundary was available at startup: exactly one REST read.
+    expect(harness.transport.fetchObservationCalls).toBe(1);
+    expect(harness.provider.invocations).toBe(0);
+
+    // Once the socket delivers, the boundary is direct and REST stays idle.
+    harness.transport.emitObservation(
+      TEST_TABLE_ID,
+      observationWith({ turnId: 'turn-ws', version: 5, eventSeq: 11 }),
+    );
+    await waitUntil(
+      () => decisionFor(harness.store, TEST_TABLE_ID, 'turn-ws')?.status === 'COMMITTED',
+      'WS turn after startup REST',
+    );
+    expect(harness.transport.fetchObservationCalls).toBe(1);
+    expect(harness.provider.invocations).toBe(1);
+    expect(harness.transport.actionRequests).toHaveLength(1);
+  });
+
+  it('ignores duplicate and reordered frames without REST, chat, provider or action work', async () => {
+    const harness = makeHarness();
+    await harness.runtime.start();
+    expect(expectStatus(harness.store, TEST_TABLE_ID, TEST_TURN_ID).status).toBe('COMMITTED');
+    const turnTwo = observationWith({ turnId: 'turn-2', version: 5, eventSeq: 20 });
+    harness.transport.emitObservation(TEST_TABLE_ID, turnTwo);
+    await waitUntil(
+      () => decisionFor(harness.store, TEST_TABLE_ID, 'turn-2')?.status === 'COMMITTED',
+      'second turn',
+    );
+    const afterTwo = {
+      observations: harness.transport.fetchObservationCalls,
+      chats: harness.transport.fetchChatCalls,
+      providers: harness.provider.invocations,
+      actions: harness.transport.actionRequests.length,
+    };
+
+    // Exact duplicate, duplicate newest, stale version, stale eventSeq, and an
+    // older reordered same-version turn change (stale eventSeq wins before the
+    // incoherent-boundary rule can ever consider recovery).
+    harness.transport.emitObservation(TEST_TABLE_ID, observationWith({}));
+    harness.transport.emitObservation(TEST_TABLE_ID, turnTwo);
+    harness.transport.emitObservation(
+      TEST_TABLE_ID,
+      observationWith({ turnId: 'turn-3', version: 4, eventSeq: 12 }),
+    );
+    harness.transport.emitObservation(
+      TEST_TABLE_ID,
+      observationWith({ turnId: 'turn-2', version: 5, eventSeq: 19 }),
+    );
+    harness.transport.emitObservation(
+      TEST_TABLE_ID,
+      observationWith({ turnId: 'turn-reordered', version: 5, eventSeq: 15 }),
+    );
+
+    // A later accepted frame proves the drops ran without extra work.
+    harness.transport.emitObservation(
+      TEST_TABLE_ID,
+      observationWith({ turnId: 'turn-4', version: 6, eventSeq: 30 }),
+    );
+    await waitUntil(
+      () => decisionFor(harness.store, TEST_TABLE_ID, 'turn-4')?.status === 'COMMITTED',
+      'later accepted turn',
+    );
+
+    expect(harness.transport.fetchObservationCalls).toBe(afterTwo.observations);
+    expect(harness.transport.fetchChatCalls).toBe(afterTwo.chats + 1);
+    expect(harness.provider.invocations).toBe(afterTwo.providers + 1);
+    expect(harness.transport.actionRequests).toHaveLength(afterTwo.actions + 1);
+    expect(harness.store.decisions.size).toBe(3);
+    expect(decisionFor(harness.store, TEST_TABLE_ID, 'turn-3')).toBeNull();
+  });
+
+  it('accepts jumped eventSeq at the same or a newer version without assuming continuity', async () => {
     const harness = makeHarness();
     harness.transport.observation = observationWith({ legalActions: [] });
     await harness.runtime.start();
     const afterStart = harness.transport.fetchObservationCalls;
 
-    // REST now exposes a turn; socket payloads claim a different, bogus turn.
-    harness.transport.observation = observationWith({ turnId: 'turn-rest' });
-    const bogus = observationWith({ turnId: 'turn-socket-bogus' });
-    for (let index = 0; index < 5; index += 1) {
-      harness.transport.emitObservation(TEST_TABLE_ID, bogus);
-    }
-    await harness.runtime.syncNow();
+    // Same version and turn: a chat event with a jumped eventSeq is a valid
+    // boundary even though eventSeq continuity is never assumed.
+    harness.transport.emitObservation(
+      TEST_TABLE_ID,
+      observationWith({ turnId: TEST_TURN_ID, version: 4, eventSeq: 50, legalActions: [] }),
+    );
+    // A turn that happens to use version + 1 with a jumped eventSeq is
+    // consumed directly; no continuity is required or assumed.
+    harness.transport.emitObservation(
+      TEST_TABLE_ID,
+      observationWith({ turnId: 'turn-jump', version: 5, eventSeq: 900 }),
+    );
+    await waitUntil(
+      () => decisionFor(harness.store, TEST_TABLE_ID, 'turn-jump')?.status === 'COMMITTED',
+      'jumped eventSeq turn',
+    );
+    // A later chat event on the committed turn, then the next turn.
+    harness.transport.emitObservation(
+      TEST_TABLE_ID,
+      observationWith({ turnId: 'turn-jump', version: 5, eventSeq: 1_200, legalActions: [] }),
+    );
+    harness.transport.emitObservation(
+      TEST_TABLE_ID,
+      observationWith({ turnId: 'turn-after-chat', version: 6, eventSeq: 1_300 }),
+    );
+    await waitUntil(
+      () => decisionFor(harness.store, TEST_TABLE_ID, 'turn-after-chat')?.status === 'COMMITTED',
+      'turn after chat event',
+    );
 
-    expect(harness.transport.fetchObservationCalls - afterStart).toBe(1);
-    const decision = expectStatus(harness.store, TEST_TABLE_ID, 'turn-rest');
-    expect(decision.status).toBe('COMMITTED');
-    expect(harness.store.getDecisionForTurn(TEST_TABLE_ID, 'turn-socket-bogus', PRINCIPAL)).toBeNull();
+    expect(harness.transport.fetchObservationCalls).toBe(afterStart);
+    expect(harness.provider.invocations).toBe(2);
+    expect(harness.transport.actionRequests).toHaveLength(2);
+  });
+
+  it('consumes a large healthy version/eventSeq jump exactly with zero REST and one fresh decision', async () => {
+    // Protocol evidence: the published SocketManager drains the latest full DB
+    // projection (packages/api/src/services/socket-manager.ts: isStaleObservation
+    // compares monotonic counters and broadcastObservation re-reads
+    // getObservation before sending), and the SDK cache only drops monotonic
+    // regressions (packages/sdk/src/socket.ts, OBSERVATION case). Neither
+    // version + 1 nor eventSeq + 1 is a delivery continuity rule, so a healthy
+    // jump must never be mistaken for a gap or trigger REST amplification.
+    const harness = makeHarness();
+    harness.transport.observation = observationWith({ legalActions: [] });
+    await harness.runtime.start();
+    const afterStart = harness.transport.fetchObservationCalls;
+    expect(afterStart).toBe(0);
+
+    const jumped = observationWith({ turnId: 'turn-jump', version: 40, eventSeq: 900 });
+    harness.transport.emitObservation(TEST_TABLE_ID, jumped);
+    await waitUntil(
+      () => decisionFor(harness.store, TEST_TABLE_ID, 'turn-jump')?.status === 'COMMITTED',
+      'healthy version jump decision',
+    );
+
+    expect(harness.transport.fetchObservationCalls).toBe(afterStart);
+    expect(harness.transport.fetchChatCalls).toBe(1);
+    expect(harness.provider.invocations).toBe(1);
+    expect(harness.transport.actionRequests).toHaveLength(1);
+    const decision = decisionFor(harness.store, TEST_TABLE_ID, 'turn-jump')!;
+    // The exact jumped projection is the durable boundary.
+    expect(decision.observationHash).toBe(computeObservationHash(jumped));
+    expect(decision.observation.version).toBe(40);
+    expect(decision.eventCursor).toBe(900);
+  });
+
+  it('coalesces an incoherent same-version turn change into one REST recovery while in flight', async () => {
+    const harness = makeHarness();
+    harness.transport.observation = observationWith({ legalActions: [] });
+    await harness.runtime.start();
+    const afterStart = harness.transport.fetchObservationCalls;
+    expect(afterStart).toBe(0);
+
+    // REST returns the coherent next projection (a newer state version).
+    const restTruth = observationWith({ turnId: 'turn-rest', version: 5, eventSeq: 40 });
+    harness.transport.observation = restTruth;
+    const realFetch = harness.transport.fetchObservation.bind(harness.transport);
+    let signalFetchStarted: () => void = () => {};
+    const fetchStarted = new Promise<void>((resolve) => {
+      signalFetchStarted = resolve;
+    });
+    let releaseFetch: () => void = () => {};
+    const fetchGate = new Promise<void>((resolve) => {
+      releaseFetch = resolve;
+    });
+    harness.transport.fetchObservation = async (tableId: string) => {
+      signalFetchStarted();
+      await fetchGate;
+      return realFetch(tableId);
+    };
+
+    // Same version, changed turn, advancing eventSeq: the one incoherent
+    // boundary shape that requires bounded recovery.
+    harness.transport.emitObservation(
+      TEST_TABLE_ID,
+      observationWith({ turnId: 'turn-incoherent-a', version: 4, eventSeq: 30 }),
+    );
+    await fetchStarted;
+    // Further incoherent boundaries and rejoin notifications must coalesce
+    // into the single in-flight recovery read.
+    harness.transport.emitObservation(
+      TEST_TABLE_ID,
+      observationWith({ turnId: 'turn-incoherent-b', version: 4, eventSeq: 31 }),
+    );
+    harness.transport.emitRecovery();
+    harness.transport.emitRecovery();
+    releaseFetch();
+
+    await waitUntil(
+      () => decisionFor(harness.store, TEST_TABLE_ID, 'turn-rest')?.status === 'COMMITTED',
+      'coherent REST recovery commit',
+    );
+    expect(harness.transport.fetchObservationCalls).toBe(afterStart + 1);
+    expect(harness.provider.invocations).toBe(1);
+    expect(harness.transport.actionRequests).toHaveLength(1);
+    expect(decisionFor(harness.store, TEST_TABLE_ID, 'turn-incoherent-a')).toBeNull();
+    expect(decisionFor(harness.store, TEST_TABLE_ID, 'turn-incoherent-b')).toBeNull();
+  });
+
+  it('coalesces rejoin recovery notifications into one REST fetch and unsubscribes on stop', async () => {
+    const harness = makeHarness();
+    harness.transport.observation = observationWith({ legalActions: [] });
+    await harness.runtime.start();
+    const afterStart = harness.transport.fetchObservationCalls;
+    expect(harness.transport.recoveryListenerCount).toBe(1);
+
+    const realFetch = harness.transport.fetchObservation.bind(harness.transport);
+    let signalFetchStarted: () => void = () => {};
+    const fetchStarted = new Promise<void>((resolve) => {
+      signalFetchStarted = resolve;
+    });
+    let releaseFetch: () => void = () => {};
+    const fetchGate = new Promise<void>((resolve) => {
+      releaseFetch = resolve;
+    });
+    harness.transport.fetchObservation = async (tableId: string) => {
+      signalFetchStarted();
+      await fetchGate;
+      return realFetch(tableId);
+    };
+
+    harness.transport.emitRecovery();
+    await fetchStarted;
+    harness.transport.emitRecovery();
+    harness.transport.emitRecovery();
+    releaseFetch();
+    await waitUntil(
+      () => harness.transport.fetchObservationCalls === afterStart + 1,
+      'single coalesced recovery fetch',
+    );
+    // The coalesced pass must fully settle (clearing its pending slot) before
+    // the next notification can start a fresh pass.
+    await flushMicrotasks();
+
+    // A later rejoin after the coalesced pass settles starts a fresh pass.
+    harness.transport.emitRecovery();
+    await waitUntil(
+      () => harness.transport.fetchObservationCalls === afterStart + 2,
+      'post-settlement recovery fetch',
+    );
+
+    await harness.runtime.stop();
+    expect(harness.transport.recoveryListenerCount).toBe(0);
+    harness.transport.emitRecovery();
+    await Promise.resolve();
+    expect(harness.transport.fetchObservationCalls).toBe(afterStart + 2);
+  });
+
+  it('queues at most one pending drain per table while a decision is in flight', async () => {
+    let releaseProvider: () => void = () => {};
+    const providerGate = new Promise<void>((resolve) => {
+      releaseProvider = resolve;
+    });
+    const harness = makeHarness({
+      script: async () => {
+        await providerGate;
+        return { kind: 'valid' };
+      },
+    });
+    harness.transport.observation = observationWith({ legalActions: [] });
+    await harness.runtime.start();
+
+    const realListDecisions = harness.store.listDecisions.bind(harness.store);
+    let listDecisionCalls = 0;
+    harness.store.listDecisions = (filter) => {
+      listDecisionCalls += 1;
+      return realListDecisions(filter);
+    };
+
+    harness.transport.emitObservation(
+      TEST_TABLE_ID,
+      observationWith({ turnId: 'turn-1', version: 5, eventSeq: 11 }),
+    );
+    await harness.provider.waitForInvocation(1);
+
+    // Chat-only frames spread across microtask turns would each enqueue a
+    // drain without the single-pending guard.
+    for (let frame = 0; frame < 5; frame += 1) {
+      harness.transport.emitObservation(
+        TEST_TABLE_ID,
+        observationWith({
+          turnId: 'turn-1',
+          version: 5,
+          eventSeq: 12 + frame,
+          legalActions: [],
+        }),
+      );
+      await flushMicrotasks();
+    }
+    const callsDuringFlight = listDecisionCalls;
+
+    releaseProvider();
+    await waitUntil(
+      () => decisionFor(harness.store, TEST_TABLE_ID, 'turn-1')?.status === 'COMMITTED',
+      'in-flight decision commit',
+    );
+    await flushMicrotasks();
+    // Exactly one coalesced drain runs after the in-flight pass settles.
+    expect(listDecisionCalls - callsDuringFlight).toBe(1);
+    expect(harness.provider.invocations).toBe(1);
+    expect(harness.transport.fetchObservationCalls).toBe(0);
+    expect(harness.transport.actionRequests).toHaveLength(1);
+  });
+
+  it('drops socket observations with a rejected viewer identity or foreign table', async () => {
+    const harness = makeHarness({
+      config: {
+        rooms: [
+          {
+            roomId: ROOM_ID,
+            tableId: TEST_TABLE_ID,
+            agentPrincipalIds: [PRINCIPAL],
+            expectedPlayerId: 'p0',
+          },
+        ],
+      },
+    });
+    harness.transport.observation = observationWith({ legalActions: [] });
+    await harness.runtime.start();
+    const afterStart = harness.transport.fetchObservationCalls;
+
+    // Schema-valid, seated viewer that is not the configured seat: the other
+    // seat's hole cards are masked so only the identity guard rejects it.
+    harness.transport.emitObservation(
+      TEST_TABLE_ID,
+      observationWith({
+        turnId: 'turn-wrong-seat',
+        version: 5,
+        eventSeq: 11,
+        viewingPlayerId: 'p1',
+        state: {
+          players: observationInput().state.players.map((player) =>
+            player === null ? null : { ...player, hand: null },
+          ),
+        },
+      }),
+    );
+    harness.transport.emitObservation(
+      TEST_TABLE_ID,
+      observationWith({
+        turnId: 'turn-unscoped',
+        version: 6,
+        eventSeq: 12,
+        viewingPlayerId: null,
+      }),
+    );
+    harness.transport.emitObservation(
+      TEST_TABLE_ID,
+      observationWith({ tableId: 'table-x', turnId: 'turn-foreign', version: 7, eventSeq: 13 }),
+    );
+    // A later valid boundary proves the rejects were processed, not lost.
+    harness.transport.emitObservation(
+      TEST_TABLE_ID,
+      observationWith({ turnId: 'turn-ok', version: 5, eventSeq: 20 }),
+    );
+    await waitUntil(
+      () => decisionFor(harness.store, TEST_TABLE_ID, 'turn-ok')?.status === 'COMMITTED',
+      'accepted boundary after rejects',
+    );
+
+    expect(harness.provider.invocations).toBe(1);
+    expect(harness.transport.actionRequests).toHaveLength(1);
+    expect(harness.transport.fetchObservationCalls).toBe(afterStart);
+    expect(harness.transport.fetchChatCalls).toBe(1);
+    expect(harness.store.decisions.size).toBe(1);
   });
 });
 
@@ -2304,28 +2757,110 @@ describe('AgentRuntime start and shutdown guards', () => {
     expect(subscriptions).toBe(0);
   });
 
-  it('resyncs on the periodic timer without socket payloads', async () => {
+  it('performs one REST recovery on the periodic watchdog', async () => {
     const harness = makeHarness({ config: { socketResyncIntervalMs: 5 } });
+    harness.transport.observation = observationWith({ legalActions: [] });
     await harness.runtime.start();
     const afterStart = harness.transport.fetchObservationCalls;
     await harness.transport.waitForFetch(afterStart + 1);
     await harness.runtime.stop();
   });
+
+  it('fetches only after the socket has been silent for the inactivity window', async () => {
+    vi.useFakeTimers();
+    try {
+      let now = 1_000_000;
+      const harness = makeHarness({
+        config: { socketResyncIntervalMs: 30_000 },
+        now: () => now,
+      });
+      harness.transport.observation = observationWith({ legalActions: [] });
+      await harness.runtime.start();
+      // The join snapshot was direct WS, so no startup REST read happened.
+      const afterStart = harness.transport.fetchObservationCalls;
+      expect(afterStart).toBe(0);
+
+      // Healthy WS delivery inside the window resets the inactivity stamp.
+      now += 29_000;
+      harness.transport.emitObservation(
+        TEST_TABLE_ID,
+        observationWith({
+          turnId: TEST_TURN_ID,
+          version: 4,
+          eventSeq: 99,
+          legalActions: [],
+        }),
+      );
+      await flushMicrotasks();
+      await vi.advanceTimersByTimeAsync(30_000);
+      await flushMicrotasks();
+      expect(harness.transport.fetchObservationCalls).toBe(afterStart);
+
+      // A duplicate frame is dropped and does NOT refresh the liveness stamp,
+      // so the window since the last accepted boundary has now elapsed.
+      now = 1_000_000 + 29_000 + 30_000;
+      harness.transport.emitObservation(
+        TEST_TABLE_ID,
+        observationWith({
+          turnId: TEST_TURN_ID,
+          version: 4,
+          eventSeq: 99,
+          legalActions: [],
+        }),
+      );
+      await flushMicrotasks();
+      await vi.advanceTimersByTimeAsync(30_000);
+      await flushMicrotasks();
+      expect(harness.transport.fetchObservationCalls).toBe(afterStart + 1);
+
+      // Silence across a full window triggers exactly one coalesced recovery.
+      now += 30_000;
+      await vi.advanceTimersByTimeAsync(30_000);
+      await flushMicrotasks();
+      expect(harness.transport.fetchObservationCalls).toBe(afterStart + 2);
+
+      // No fetch storm between windows.
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushMicrotasks();
+      expect(harness.transport.fetchObservationCalls).toBe(afterStart + 2);
+
+      await harness.runtime.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe('AgentRuntime defensive sync paths', () => {
-  it('audits observation failures and mismatched table observations', async () => {
+  it('audits recovery REST failures and mismatched recovery observations', async () => {
     const failed = makeHarness();
-    failed.transport.observationError = new Error('observation down');
     await failed.runtime.start();
+    const afterStart = failed.provider.invocations;
+    // The one incoherent boundary shape (same version, changed turn, advancing
+    // eventSeq) requires bounded recovery; REST is down during it.
+    failed.transport.observationError = new Error('observation down');
+    failed.transport.emitObservation(
+      TEST_TABLE_ID,
+      observationWith({ turnId: 'turn-incoherent', version: 4, eventSeq: 20 }),
+    );
+    await failed.runtime.syncNow();
     expect(hasAudit(failed.audits, 'OBSERVATION_FAILED')).toBe(true);
-    expect(failed.provider.invocations).toBe(0);
+    expect(failed.provider.invocations).toBe(afterStart);
+    expect(decisionFor(failed.store, TEST_TABLE_ID, 'turn-incoherent')).toBeNull();
 
     const mismatch = makeHarness();
-    mismatch.transport.observation = observationWith({ tableId: 'table-x' });
     await mismatch.runtime.start();
+    const afterMismatch = mismatch.provider.invocations;
+    // The recovery REST read returns an observation for another table.
+    mismatch.transport.observation = observationWith({ tableId: 'table-x' });
+    mismatch.transport.emitObservation(
+      TEST_TABLE_ID,
+      observationWith({ turnId: 'turn-incoherent', version: 4, eventSeq: 20 }),
+    );
+    await mismatch.runtime.syncNow();
     expect(hasAudit(mismatch.audits, 'OBSERVATION_IDENTITY_MISMATCH')).toBe(true);
-    expect(mismatch.provider.invocations).toBe(0);
+    expect(mismatch.provider.invocations).toBe(afterMismatch);
+    expect(decisionFor(mismatch.store, TEST_TABLE_ID, 'turn-incoherent')).toBeNull();
   });
 
   it('audits store listing failures as sync failures', async () => {
@@ -2768,8 +3303,13 @@ describe('AgentRuntime provider and action edge paths', () => {
     await harness.runtime.start();
     const internals = harness.runtime as unknown as { config: AgentRuntimeConfig };
     internals.config.promptPolicyId = 'mutated-policy';
-    harness.transport.observation = observationWith({ turnId: 'turn-2', version: 5, eventSeq: 11 });
-    await harness.runtime.syncNow();
+    harness.transport.publishObservation(
+      observationWith({ turnId: 'turn-2', version: 5, eventSeq: 11 }),
+    );
+    await waitUntil(
+      () => decisionFor(harness.store, TEST_TABLE_ID, 'turn-2')?.status === 'FAILED',
+      'prompt policy rejection',
+    );
     const second = expectStatus(harness.store, TEST_TABLE_ID, 'turn-2');
     expect(second.status).toBe('FAILED');
     expect(second.errorReason).toContain('prompt_policy_rejected');
@@ -2799,9 +3339,14 @@ describe('AgentRuntime provider and action edge paths', () => {
     });
     harness.transport.observation = observationWith({ legalActions: [] });
     await harness.runtime.start();
-    harness.transport.observation = observationWith({ turnId: 'turn-2', version: 5, eventSeq: 11 });
     now = 1_000_100;
-    await harness.runtime.syncNow();
+    harness.transport.publishObservation(
+      observationWith({ turnId: 'turn-2', version: 5, eventSeq: 11 }),
+    );
+    await waitUntil(
+      () => decisionFor(harness.store, TEST_TABLE_ID, 'turn-2')?.status === 'FAILED',
+      'relative deadline exhaustion',
+    );
     const decision = expectStatus(harness.store, TEST_TABLE_ID, 'turn-2');
     expect(decision.status).toBe('FAILED');
     expect(decision.errorReason).toContain('runtime_deadline_exhausted');

@@ -313,6 +313,7 @@ function setup(options: {
 
 let store: ProductStore | null = null;
 afterEach(() => {
+  vi.useRealTimers();
   store?.close();
   store = null;
 });
@@ -1074,5 +1075,261 @@ describe('product rooms', () => {
       ),
     ).toBe('NOT_AUTHORIZED');
     expect(new ProductRoomError('ROOM_FULL', 'x').code).toBe('ROOM_FULL');
+  });
+});
+
+describe('product room reconciliation coordination', () => {
+  /** Deterministic microtask latch (no timers involved). */
+  async function waitFor(predicate: () => boolean, what: string): Promise<void> {
+    for (let attempt = 0; attempt < 1_000; attempt += 1) {
+      if (predicate()) return;
+      await Promise.resolve();
+    }
+    throw new Error(`timed out waiting for ${what}`);
+  }
+
+  function agentOnlyRoom(rooms: ProductRooms, name: string): ReturnType<ProductRooms['create']> {
+    return rooms.create({
+      name,
+      mode: 'SPONSORED',
+      humanCount: 0,
+      agentIds: ['ace', 'bee'],
+      finance: null,
+      creator: null,
+      admin: true,
+    });
+  }
+
+  it('single-flights overlapping reconcileAll and reconcileRoom passes', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const { rooms, competitions } = openSetup();
+      const room = agentOnlyRoom(rooms, 'Overlap');
+      const active = await rooms.start(room.id, { principalId: null, admin: true });
+      expect(active.status).toBe('ACTIVE');
+
+      const get = competitions.getCompetition.bind(competitions);
+      let entered = 0;
+      let release: () => void = () => {};
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      vi.spyOn(competitions, 'getCompetition').mockImplementation(async (competitionId) => {
+        entered += 1;
+        await gate;
+        return get(competitionId);
+      });
+
+      // ACTIVE cadence: the room becomes due one interval after start.
+      vi.setSystemTime(Date.now() + 30_000);
+      const first = rooms.reconcileAll();
+      await waitFor(() => entered === 1, 'in-flight reconcile read');
+      const second = rooms.reconcileAll();
+      expect(second).toBe(first);
+      const perRoom = rooms.reconcileRoom(active.id);
+      expect(rooms.reconcileRoom(active.id)).toBe(perRoom);
+      expect(entered).toBe(1);
+
+      release();
+      const [counts] = await Promise.all([first, second]);
+      expect(counts.PENDING).toBe(1);
+      expect(await perRoom).toBe('PENDING');
+      expect(entered).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('serializes an explicit start behind an in-flight recovery pass for the same room', async () => {
+    const { rooms, competitions, probe } = openSetup();
+    const room = agentOnlyRoom(rooms, 'Serialized');
+    competitions.failStartOnce = true;
+    await expect(
+      rooms.start(room.id, { principalId: null, admin: true }),
+    ).rejects.toMatchObject({ code: 'PLATFORM_REJECTED' });
+    expect(rooms.get(room.id).status).toBe('PROVISIONING');
+    expect(competitions.startKeys).toHaveLength(0);
+
+    const get = competitions.getCompetition.bind(competitions);
+    let entered = 0;
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    vi.spyOn(competitions, 'getCompetition').mockImplementation(async (competitionId) => {
+      entered += 1;
+      await gate;
+      return get(competitionId);
+    });
+
+    const reconciling = rooms.reconcileRoom(room.id);
+    await waitFor(() => entered === 1, 'gated recovery read');
+    const readinessWhileGated = vi.mocked(probe.readiness).mock.calls.length;
+
+    // The explicit start queues behind the same-room operation and must not
+    // begin its own readiness or provisioning work while the read is held.
+    const starting = rooms.start(room.id, { principalId: null, admin: true });
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(vi.mocked(probe.readiness).mock.calls.length).toBe(readinessWhileGated);
+    expect(competitions.startKeys).toHaveLength(0);
+
+    release();
+    expect(await reconciling).toBe('ACTIVE');
+    const resumed = await starting;
+    expect(resumed.status).toBe('ACTIVE');
+    expect(competitions.startKeys).toHaveLength(1);
+  });
+
+  it('paces ACTIVE lifecycle reads at 30s and never polls terminal rooms', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const { rooms, competitions } = openSetup();
+      const room = agentOnlyRoom(rooms, 'Cadence');
+      const active = await rooms.start(room.id, { principalId: null, admin: true });
+      expect(active.status).toBe('ACTIVE');
+      const getCalls = competitions.getCalls;
+
+      // A periodic pass immediately after start is skipped by the cadence.
+      vi.setSystemTime(Date.now() + 29_000);
+      let counts = await rooms.reconcileAll();
+      expect(counts.SKIPPED).toBe(1);
+      expect(competitions.getCalls).toBe(getCalls);
+
+      // One interval later exactly one lifecycle read happens.
+      vi.setSystemTime(Date.now() + 1_000);
+      counts = await rooms.reconcileAll();
+      expect(counts.PENDING).toBe(1);
+      expect(competitions.getCalls).toBe(getCalls + 1);
+
+      // And then it waits again instead of hammering the platform.
+      vi.setSystemTime(Date.now() + 1_000);
+      counts = await rooms.reconcileAll();
+      expect(counts.SKIPPED).toBe(1);
+      expect(competitions.getCalls).toBe(getCalls + 1);
+
+      // Terminal settlement: one final pass records the immutable result.
+      competitions.setCompetition(active.pokerCompetitionId!, {
+        status: 'FINISHED',
+        finishedAt: new Date().toISOString(),
+      });
+      vi.setSystemTime(Date.now() + 30_000);
+      counts = await rooms.reconcileAll();
+      expect(counts.COMPLETED).toBe(1);
+      expect(rooms.get(room.id).status).toBe('COMPLETE');
+      const terminalReads = competitions.getCalls;
+
+      // Terminal history is never polled again, however late the pass runs.
+      vi.setSystemTime(Date.now() + 600_000);
+      counts = await rooms.reconcileAll();
+      expect(counts.SKIPPED).toBe(1);
+      expect(competitions.getCalls).toBe(terminalReads);
+      expect(rooms.get(room.id).results).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('retries PROVISIONING recovery on the shorter 5s cadence', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const { rooms, competitions } = openSetup();
+      const room = agentOnlyRoom(rooms, 'RecoverFast');
+      competitions.failStartOnce = true;
+      await expect(
+        rooms.start(room.id, { principalId: null, admin: true }),
+      ).rejects.toMatchObject({ code: 'PLATFORM_REJECTED' });
+      expect(rooms.get(room.id).status).toBe('PROVISIONING');
+
+      // Recovery cadence: skipped before 5s, due at 5s.
+      vi.setSystemTime(Date.now() + 4_000);
+      let counts = await rooms.reconcileAll();
+      expect(counts.SKIPPED).toBe(1);
+      expect(competitions.startKeys).toHaveLength(0);
+
+      vi.setSystemTime(Date.now() + 1_000);
+      counts = await rooms.reconcileAll();
+      expect(counts.ACTIVE).toBe(1);
+      expect(rooms.get(room.id).status).toBe('ACTIVE');
+      expect(competitions.startKeys).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('re-enables a terminal room cadence when recorded work appears late', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const runtime: RoomRuntime = {
+        attach: vi.fn(async () => undefined),
+        detach: vi.fn(async () => undefined),
+        recoverRecorded: vi.fn(async () => undefined),
+      };
+      const { rooms, competitions, store } = openSetup({ runtime });
+      const room = agentOnlyRoom(rooms, 'LateTrace');
+      const active = await rooms.start(room.id, { principalId: null, admin: true });
+      competitions.setCompetition(active.pokerCompetitionId!, {
+        status: 'FINISHED',
+        finishedAt: new Date().toISOString(),
+      });
+      vi.setSystemTime(Date.now() + 30_000);
+      expect((await rooms.reconcileAll()).COMPLETED).toBe(1);
+      expect(store.getRoomResult(room.id)).not.toBeNull();
+
+      // Terminal history with no pending trace is never polled.
+      vi.setSystemTime(Date.now() + 600_000);
+      expect((await rooms.reconcileAll()).SKIPPED).toBe(1);
+      expect(runtime.recoverRecorded).not.toHaveBeenCalled();
+
+      // A late durable response appears after the terminal detach.
+      const decision = store.observeDecision({
+        tableId: active.pokerTableId!,
+        turnId: 'turn-late',
+        principalId: 'svc:ace',
+        roomId: room.id,
+        observation: seatObservationFixture({
+          tableId: active.pokerTableId!,
+          turnId: 'turn-late',
+        }),
+        promptPolicyId: seatPromptPolicy.id,
+        eventCursor: 1,
+      });
+      const started = store.startAttempt(decision.id, JSON.stringify({ request: 1 }));
+      expect(started.kind).toBe('started');
+      if (started.kind === 'started') {
+        store.recordAttemptResponse(decision.id, started.attempt.id, {
+          status: 'SUCCEEDED',
+          responseJson: JSON.stringify({ response: 1 }),
+          model: 'test-model',
+          provider: 'openai-compatible',
+          promptPolicyId: seatPromptPolicy.id,
+          usage: { promptTokens: 1, completionTokens: 1, costMicroUsd: 0, latencyMs: 1 },
+        });
+      }
+
+      // Local evidence re-enables just this room's recovery.
+      vi.setSystemTime(Date.now() + 60_000);
+      expect((await rooms.reconcileAll()).PENDING).toBe(1);
+      expect(runtime.recoverRecorded).toHaveBeenCalledTimes(1);
+
+      // Pending terminal work retries on the 5s recovery cadence.
+      vi.setSystemTime(Date.now() + 4_000);
+      expect((await rooms.reconcileAll()).SKIPPED).toBe(1);
+      vi.setSystemTime(Date.now() + 1_000);
+      expect((await rooms.reconcileAll()).PENDING).toBe(1);
+      expect(runtime.recoverRecorded).toHaveBeenCalledTimes(2);
+
+      // Once the durable work is committed, the cadence disables again.
+      store.submitResolvedAction(decision.id, JSON.stringify({ action: 'act-check' }));
+      store.commitDecision(decision.id, JSON.stringify({ receipt: { requestId: decision.id } }));
+      vi.setSystemTime(Date.now() + 5_000);
+      expect((await rooms.reconcileAll()).SKIPPED).toBe(1);
+      vi.setSystemTime(Date.now() + 600_000);
+      expect((await rooms.reconcileAll()).SKIPPED).toBe(1);
+      expect(runtime.recoverRecorded).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

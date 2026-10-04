@@ -4,9 +4,8 @@
  * One runtime drives one authenticated agent principal across a bounded set of
  * rooms. For every turn it:
  *
- * 1. fetches the authoritative observation over the agent's own SDK session
- *    (socket messages and replay are never turn authority; sockets only
- *    coalesce resync triggers);
+ * 1. consumes the authoritative masked observation over the agent's own SDK
+ *    socket, using REST only for startup and transport recovery;
  * 2. persists the exact observation boundary plus the allowed public chat
  *    source at `(tableId, turnId, principalId)` before any provider I/O;
  * 3. persists the exact sanitized provider request as an immutable attempt
@@ -71,7 +70,9 @@ import {
 } from './contracts.js';
 
 const DEFAULT_SAFETY_MARGIN_MS = 250;
-const DEFAULT_RESYNC_INTERVAL_MS = 5_000;
+// Silent subscriptions cannot prove freshness indefinitely. This watchdog is
+// recovery, not a turn poll; ongoing canonical WS delivery resets it.
+const DEFAULT_RESYNC_INTERVAL_MS = 300_000;
 const DEFAULT_MAX_CONCURRENCY = 4;
 /** Provider attempts per decision: one call plus one abandoned-attempt recovery. */
 export const MAX_PROVIDER_ATTEMPTS_PER_DECISION = 2;
@@ -373,7 +374,13 @@ export class AgentRuntime {
   private readonly unsubscribeTriggers: Array<() => void> = [];
   private readonly inFlightDecisions = new Set<string>();
   private readonly tableChains = new Map<string, Promise<void>>();
+  private readonly queuedTables = new Set<string>();
   private readonly dirtyTables = new Set<string>();
+  private readonly pendingObservations = new Map<string, CanonicalSeatObservation>();
+  private readonly latestObservations = new Map<string, CanonicalSeatObservation>();
+  private readonly lastSocketAt = new Map<string, number>();
+  private readonly recoveryPending = new Set<string>();
+  private readonly gapObservations = new Map<string, CanonicalSeatObservation>();
   private readonly tracked = new Set<Promise<void>>();
 
   private controller = new AbortController();
@@ -457,7 +464,7 @@ export class AgentRuntime {
 
   /**
    * Connect the authenticated transport, verify the principal matches the
-   * configured one, subscribe socket triggers and start periodic REST resync.
+   * configured one, subscribe canonical observations and start recovery watchdog.
    */
   async start(): Promise<void> {
     if (this.running) return;
@@ -488,16 +495,27 @@ export class AgentRuntime {
         this.roomsByTable.set(room.tableId, room);
         this.tableIds.push(room.tableId);
         this.unsubscribeTriggers.push(
-          this.transport.onObservation(room.tableId, () => {
-            this.scheduleTable(room.tableId);
+          this.transport.onObservation(room.tableId, (observation) => {
+            this.receiveObservation(room.tableId, observation);
           }),
         );
       }
       this.audit('AUTHORITY_ESTABLISHED', { detail: { servedTables: this.tableIds.length } });
-      for (const tableId of this.tableIds) this.scheduleTable(tableId);
+      if (this.transport.onRecovery !== undefined) {
+        this.unsubscribeTriggers.push(this.transport.onRecovery(() => {
+          for (const tableId of this.tableIds) this.scheduleTable(tableId);
+        }));
+      }
+      for (const tableId of this.tableIds) {
+        if (!this.latestObservations.has(tableId)) this.scheduleTable(tableId);
+      }
       if (this.tableIds.length > 0) {
         this.resyncTimer = setInterval(() => {
-          for (const tableId of this.tableIds) this.scheduleTable(tableId);
+          for (const tableId of this.tableIds) {
+            if (this.clock() - (this.lastSocketAt.get(tableId) ?? this.startedAtMs) >= this.resyncIntervalMs) {
+              this.scheduleTable(tableId);
+            }
+          }
         }, this.resyncIntervalMs);
         const timer = this.resyncTimer as { unref?: () => void };
         if (typeof timer.unref === 'function') timer.unref();
@@ -597,11 +615,46 @@ export class AgentRuntime {
   }
 
   // -------------------------------------------------------------------------
-  // Observation sync (coalesced socket triggers + periodic REST resync)
+  // Canonical WS observations + coalesced REST recovery
   // -------------------------------------------------------------------------
 
   private scheduleTable(tableId: string): void {
     if (this.stopping || !this.roomsByTable.has(tableId)) return;
+    if (this.recoveryPending.has(tableId)) return;
+    this.recoveryPending.add(tableId);
+    this.markDirty(tableId);
+  }
+
+  private receiveObservation(tableId: string, observation: CanonicalSeatObservation): void {
+    const room = this.roomsByTable.get(tableId);
+    if (this.stopping || room === undefined) return;
+    // Validate without substituting Zod's cloned/normalized result: the exact
+    // object received from the authenticated server is the durable boundary.
+    if (!CanonicalSeatObservationSchema.safeParse(observation).success ||
+        observation.tableId !== tableId || this.viewingPlayerGuard(room, observation) !== null) return;
+    const previous = this.latestObservations.get(tableId);
+    if (previous !== undefined) {
+      if (observation.version < previous.version || observation.eventSeq <= previous.eventSeq) return;
+      // The published socket drains notifications by reading the latest full
+      // projection: intermediate versions are NOT guaranteed to be delivered.
+      // Neither version + 1 nor eventSeq + 1 is a stream continuity rule.
+      // A changed turn at the SAME state version is an incoherent boundary,
+      // unlike a perfectly valid newer snapshot that skips intermediate state.
+      if (observation.version === previous.version && observation.turnId !== previous.turnId) {
+        const gap = this.gapObservations.get(tableId);
+        if (gap !== undefined && observation.version <= gap.version && observation.eventSeq <= gap.eventSeq) return;
+        this.gapObservations.set(tableId, observation);
+        this.scheduleTable(tableId);
+        return;
+      }
+    }
+    this.lastSocketAt.set(tableId, this.clock());
+    this.latestObservations.set(tableId, observation);
+    this.pendingObservations.set(tableId, observation);
+    this.markDirty(tableId);
+  }
+
+  private markDirty(tableId: string): void {
     this.dirtyTables.add(tableId);
     if (this.pumpScheduled) return;
     this.pumpScheduled = true;
@@ -615,9 +668,17 @@ export class AgentRuntime {
   }
 
   private enqueueTableSync(tableId: string): void {
+    // While a decision is in flight, retain only one queued drain of the
+    // latest boundary. Separate WS microtasks must not build an unbounded
+    // chain of empty durable-replay passes.
+    if (this.queuedTables.has(tableId)) return;
+    this.queuedTables.add(tableId);
     const previous = this.tableChains.get(tableId) ?? Promise.resolve();
     const next = previous
-      .then(() => this.syncTable(tableId))
+      .then(() => {
+        this.queuedTables.delete(tableId);
+        return this.syncTable(tableId);
+      })
       .catch((error: unknown) => {
         this.audit('SYNC_FAILED', { tableId, detail: { reason: describeError(error) } });
       });
@@ -642,16 +703,21 @@ export class AgentRuntime {
     const room = this.roomsByTable.get(tableId);
     if (room === undefined) return;
 
-    let current: CanonicalSeatObservation | null = null;
-    try {
-      current = await this.transport.fetchObservation(tableId);
-    } catch (error) {
-      this.audit('OBSERVATION_FAILED', {
-        tableId,
-        detail: { reason: describeError(error) },
-      });
+    let current: CanonicalSeatObservation | null = this.pendingObservations.get(tableId) ?? null;
+    this.pendingObservations.delete(tableId);
+    if (this.recoveryPending.has(tableId)) {
+      try {
+        current = await this.transport.fetchObservation(tableId);
+      } catch (error) {
+        this.audit('OBSERVATION_FAILED', { tableId, detail: { reason: describeError(error) } });
+      } finally {
+        this.recoveryPending.delete(tableId);
+      }
     }
     if (this.stopping) return;
+    if (current !== null && !CanonicalSeatObservationSchema.safeParse(current).success) {
+      current = null;
+    }
     if (current !== null && current.tableId !== tableId) {
       this.audit('OBSERVATION_IDENTITY_MISMATCH', {
         tableId,
@@ -672,6 +738,17 @@ export class AgentRuntime {
           },
         });
         current = null;
+      }
+    }
+
+    if (current !== null) {
+      const latest = this.latestObservations.get(tableId);
+      if (latest !== undefined && (current.version < latest.version || current.eventSeq < latest.eventSeq ||
+          (current.version > latest.version && current.eventSeq === latest.eventSeq) ||
+          (current.version === latest.version && current.turnId !== latest.turnId))) {
+        current = latest;
+      } else {
+        this.latestObservations.set(tableId, current);
       }
     }
 

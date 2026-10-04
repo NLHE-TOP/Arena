@@ -9,7 +9,7 @@
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   CanonicalActionResultSchema,
   ChatMessageSchema,
@@ -210,8 +210,8 @@ class FakeWebSocket {
       requestId?: string;
     };
     if (message.type === 'JOIN' && message.tableId !== undefined) {
-      if (FakeWebSocket.failJoinForTables.has(message.tableId)) return;
       const tableId = message.tableId;
+      if (FakeWebSocket.failJoinForTables.has(tableId)) return;
       queueMicrotask(() => {
         this.deliver({
           type: 'OBSERVATION',
@@ -434,27 +434,75 @@ describe('SdkAgentTransport socket triggers', () => {
     }
   });
 
-  it('tolerates failed trigger joins at connect and while connected', async () => {
+  it('notifies recovery listeners when the authenticated socket connects', async () => {
     FakeWebSocket.reset();
     const platform = await startFakePlatform();
-    FakeWebSocket.failJoinForTables.add('table-fail-connect');
     const transport = new SdkAgentTransport({
       baseUrl: platform.url,
       token: TOKEN,
       WebSocket: FakeWebSocket as unknown as typeof WebSocket,
     });
-    const off = transport.onObservation('table-fail-connect', () => {});
+    let recoveries = 0;
+    const off = transport.onRecovery(() => {
+      recoveries += 1;
+    });
+    try {
+      await transport.connect();
+      expect(recoveries).toBe(1);
+      off();
+      transport.close();
+    } finally {
+      await platform.close();
+    }
+  });
+
+  it('notifies recovery listeners on socket connect and a timed-out trigger join', async () => {
+    FakeWebSocket.reset();
+    const platform = await startFakePlatform();
+    const transport = new SdkAgentTransport({
+      baseUrl: platform.url,
+      token: TOKEN,
+      WebSocket: FakeWebSocket as unknown as typeof WebSocket,
+    });
+    let recoveries = 0;
+    const offRecovery = transport.onRecovery(() => {
+      recoveries += 1;
+    });
+    const off = transport.onObservation('table-ok', () => {});
     try {
       await transport.connect();
       expect(transport.principalId).toBe(PRINCIPAL_ID);
-      // A failing join while connected is swallowed by the best-effort catch.
-      FakeWebSocket.failJoinForTables.add('table-fail-live');
-      const offLive = transport.onObservation('table-fail-live', () => {});
-      await Promise.resolve();
-      await Promise.resolve();
-      offLive();
-      off();
+      // Exactly one notification from the socket connect; the healthy join
+      // for `table-ok` resolves with its observation.
+      expect(recoveries).toBe(1);
+      const baseline = recoveries;
+
+      vi.useFakeTimers();
+      try {
+        // A silent join rejection surfaces after the SDK join timeout.
+        FakeWebSocket.failJoinForTables.add('table-fail-live');
+        const offLive = transport.onObservation('table-fail-live', () => {});
+        await vi.advanceTimersByTimeAsync(10_000);
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(recoveries).toBe(baseline + 1);
+        offLive();
+
+        // An unsubscribed recovery listener is never notified again.
+        offRecovery();
+        FakeWebSocket.failJoinForTables.add('table-fail-after');
+        const offAfter = transport.onObservation('table-fail-after', () => {});
+        await vi.advanceTimersByTimeAsync(10_000);
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(recoveries).toBe(baseline + 1);
+        offAfter();
+      } finally {
+        vi.useRealTimers();
+      }
     } finally {
+      offRecovery();
+      off();
       await platform.close();
     }
   });
