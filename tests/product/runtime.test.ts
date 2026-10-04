@@ -885,6 +885,64 @@ function makeConfig(overrides: Partial<AgentRuntimeConfig> = {}): AgentRuntimeCo
   };
 }
 
+/**
+ * SHOW/DEAL control boundary: a nonempty authoritative server menu with no
+ * betting actor (`actionTo: null`). The menu is never filtered locally.
+ */
+function showBoundary(
+  overrides: { turnId?: string; version?: number; eventSeq?: number } = {},
+): SeatObservation {
+  return observationWith({
+    turnId: overrides.turnId ?? 'turn-show',
+    version: overrides.version ?? 5,
+    eventSeq: overrides.eventSeq ?? 11,
+    legalActions: [
+      { actionId: 'act-show', family: 'SHOW' },
+      { actionId: 'act-muck', family: 'MUCK' },
+      { actionId: 'act-deal', family: 'DEAL' },
+    ],
+    state: { actionTo: null },
+  });
+}
+
+/** A seated other player is on the clock while this runtime views seat 0. */
+function otherActorBoundary(turnId: string, version: number, eventSeq: number): SeatObservation {
+  return observationWith({ turnId, version, eventSeq, state: { actionTo: 1 } });
+}
+
+/**
+ * Coherent acting boundary: `viewingPlayerId` is exactly
+ * `players[actionTo].id`, so the acting-viewer guard accepts it. Non-actor
+ * hole cards stay masked.
+ */
+function actingBoundary(options: {
+  actorSeat?: number;
+  turnId: string;
+  version: number;
+  eventSeq: number;
+  timeBankSeconds?: number;
+}): SeatObservation {
+  const base = observationInput();
+  const actorSeat = options.actorSeat ?? 0;
+  const actorId = base.state.players[actorSeat]!.id;
+  const players = base.state.players.map((player) =>
+    player === null ? null : { ...player, hand: player.id === actorId ? player.hand : null },
+  );
+  return observationWith({
+    turnId: options.turnId,
+    version: options.version,
+    eventSeq: options.eventSeq,
+    viewingPlayerId: actorId,
+    state: {
+      actionTo: actorSeat,
+      players,
+      ...(options.timeBankSeconds === undefined
+        ? {}
+        : { timeBanks: { [String(actorSeat)]: options.timeBankSeconds } }),
+    },
+  });
+}
+
 interface Harness {
   store: MemoryDecisionStore;
   transport: FakeTransport;
@@ -2143,6 +2201,286 @@ describe('AgentRuntime canonical WS observations', () => {
     expect(harness.transport.fetchObservationCalls).toBe(afterStart);
     expect(harness.transport.fetchChatCalls).toBe(1);
     expect(harness.store.decisions.size).toBe(1);
+  });
+});
+
+describe('AgentRuntime acting-viewer boundary guard', () => {
+  it('creates no fresh decision for advancing SHOW/DEAL control boundaries', async () => {
+    const harness = makeHarness();
+    const first = showBoundary({ turnId: 'turn-show-1', version: 5, eventSeq: 11 });
+    harness.transport.observation = first;
+    await harness.runtime.start();
+    const afterStart = harness.transport.fetchObservationCalls;
+    expect(harness.provider.invocations).toBe(0);
+
+    // Several authoritative SHOW/DEAL snapshots, each advancing version and
+    // turnId, with a nonempty server menu but no betting actor.
+    harness.transport.emitObservation(
+      TEST_TABLE_ID,
+      showBoundary({ turnId: 'turn-show-2', version: 6, eventSeq: 12 }),
+    );
+    harness.transport.emitObservation(
+      TEST_TABLE_ID,
+      showBoundary({ turnId: 'turn-show-3', version: 7, eventSeq: 13 }),
+    );
+    // A real betting turn proves the queue was processed.
+    harness.transport.emitObservation(
+      TEST_TABLE_ID,
+      actingBoundary({ turnId: 'turn-actor', version: 8, eventSeq: 14 }),
+    );
+    await waitUntil(
+      () => decisionFor(harness.store, TEST_TABLE_ID, 'turn-actor')?.status === 'COMMITTED',
+      'acting turn after SHOW boundaries',
+    );
+
+    // Only the acting turn produced work: SHOW/DEAL contributed no decision,
+    // no chat fetch, no action, no provider call and no REST recovery read.
+    expect(harness.store.decisions.size).toBe(1);
+    expect(decisionFor(harness.store, TEST_TABLE_ID, 'turn-show-1')).toBeNull();
+    expect(decisionFor(harness.store, TEST_TABLE_ID, 'turn-show-2')).toBeNull();
+    expect(decisionFor(harness.store, TEST_TABLE_ID, 'turn-show-3')).toBeNull();
+    expect(harness.provider.invocations).toBe(1);
+    expect(harness.transport.fetchChatCalls).toBe(1);
+    expect(harness.transport.actionRequests).toHaveLength(1);
+    expect(harness.transport.fetchObservationCalls).toBe(afterStart);
+    const observed = harness.audits.filter((event) => event.code === 'DECISION_OBSERVED');
+    expect(observed).toHaveLength(1);
+    expect(observed[0]!.turnId).toBe('turn-actor');
+  });
+
+  it('creates no decision when another seat is on the clock with legal controls', async () => {
+    const harness = makeHarness();
+    harness.transport.observation = observationWith({ legalActions: [] });
+    await harness.runtime.start();
+    const afterStart = harness.transport.fetchObservationCalls;
+
+    harness.transport.emitObservation(
+      TEST_TABLE_ID,
+      otherActorBoundary('turn-other-1', 5, 11),
+    );
+    harness.transport.emitObservation(
+      TEST_TABLE_ID,
+      otherActorBoundary('turn-other-2', 6, 12),
+    );
+    harness.transport.emitObservation(
+      TEST_TABLE_ID,
+      otherActorBoundary('turn-other-3', 7, 13),
+    );
+    harness.transport.emitObservation(
+      TEST_TABLE_ID,
+      actingBoundary({ turnId: 'turn-actor', version: 8, eventSeq: 14 }),
+    );
+    await waitUntil(
+      () => decisionFor(harness.store, TEST_TABLE_ID, 'turn-actor')?.status === 'COMMITTED',
+      'acting turn after other-seat boundaries',
+    );
+
+    expect(harness.store.decisions.size).toBe(1);
+    expect(decisionFor(harness.store, TEST_TABLE_ID, 'turn-other-1')).toBeNull();
+    expect(decisionFor(harness.store, TEST_TABLE_ID, 'turn-other-2')).toBeNull();
+    expect(decisionFor(harness.store, TEST_TABLE_ID, 'turn-other-3')).toBeNull();
+    expect(harness.provider.invocations).toBe(1);
+    expect(harness.transport.fetchChatCalls).toBe(1);
+    expect(harness.transport.actionRequests).toHaveLength(1);
+    expect(harness.transport.fetchObservationCalls).toBe(afterStart);
+  });
+
+  it('keeps a legitimate acting turn with a time bank and the exact server menu', async () => {
+    const harness = makeHarness({
+      config: {
+        rooms: [
+          {
+            roomId: ROOM_ID,
+            tableId: TEST_TABLE_ID,
+            agentPrincipalIds: [PRINCIPAL],
+            expectedPlayerId: 'p1',
+          },
+        ],
+      },
+    });
+    const actor = actingBoundary({
+      actorSeat: 1,
+      turnId: 'turn-bank',
+      version: 5,
+      eventSeq: 11,
+      timeBankSeconds: 5,
+    });
+    harness.transport.observation = actor;
+    await harness.runtime.start();
+
+    const decision = expectStatus(harness.store, TEST_TABLE_ID, 'turn-bank');
+    expect(decision.status).toBe('COMMITTED');
+    expect(harness.provider.invocations).toBe(1);
+    expect(harness.transport.actionRequests).toHaveLength(1);
+    // The authoritative menu is persisted exactly as received: no local
+    // filtering or action rewriting.
+    expect(decision.observation.legalActions).toEqual(observationInput().legalActions);
+    expect(decision.observationHash).toBe(computeObservationHash(actor));
+    expect(hasAudit(harness.audits, 'DECISION_STALE')).toBe(false);
+  });
+
+  it('marks an OBSERVED non-actor boundary STALE after the integrity check', async () => {
+    const store = new MemoryDecisionStore();
+    const boundary = showBoundary({ turnId: 'turn-stale', version: 5, eventSeq: 11 });
+    const decision = store.observeDecision({
+      tableId: TEST_TABLE_ID,
+      turnId: boundary.turnId,
+      principalId: PRINCIPAL,
+      roomId: ROOM_ID,
+      observation: boundary,
+      observationHash: computeObservationHash(boundary),
+      source: null,
+      promptPolicyId: seatPromptPolicy.id,
+      eventCursor: boundary.eventSeq,
+    });
+    const harness = makeHarness({
+      store,
+      script: () => {
+        throw new Error('provider must not be called');
+      },
+    });
+    harness.transport.observation = boundary;
+    await harness.runtime.start();
+
+    const reloaded = store.getDecision(decision.id)!;
+    expect(reloaded.status).toBe('STALE');
+    expect(reloaded.errorReason).toContain('non_acting_boundary');
+    expect(harness.provider.invocations).toBe(0);
+    expect(store.listAttempts(decision.id)).toHaveLength(0);
+    expect(harness.transport.actionRequests).toHaveLength(0);
+    expect(hasAudit(harness.audits, 'DECISION_STALE')).toBe(true);
+
+    // Integrity still wins over the boundary guard (guard runs after it).
+    const corruptStore = new MemoryDecisionStore();
+    const corrupt = corruptStore.observeDecision({
+      tableId: TEST_TABLE_ID,
+      turnId: boundary.turnId,
+      principalId: PRINCIPAL,
+      roomId: ROOM_ID,
+      observation: boundary,
+      observationHash: computeObservationHash(boundary),
+      source: null,
+      promptPolicyId: seatPromptPolicy.id,
+      eventCursor: boundary.eventSeq,
+    });
+    corruptStore.decisions.set(corrupt.id, { ...corrupt, observationHash: 'a'.repeat(64) });
+    const corruptHarness = makeHarness({
+      store: corruptStore,
+      script: () => {
+        throw new Error('provider must not be called');
+      },
+    });
+    corruptHarness.transport.observation = boundary;
+    await corruptHarness.runtime.start();
+    expect(corruptStore.getDecision(corrupt.id)?.status).toBe('FAILED');
+    expect(corruptStore.getDecision(corrupt.id)?.errorReason).toContain(
+      'observation_integrity_failure',
+    );
+    expect(corruptHarness.provider.invocations).toBe(0);
+  });
+
+  it('still resolves recorded and stored SHOW work without a new provider call', async () => {
+    const recordedStore = new MemoryDecisionStore();
+    const recordedBoundary = showBoundary({
+      turnId: 'turn-recorded-show',
+      version: 5,
+      eventSeq: 11,
+    });
+    const recorded = recordedStore.observeDecision({
+      tableId: TEST_TABLE_ID,
+      turnId: recordedBoundary.turnId,
+      principalId: PRINCIPAL,
+      roomId: ROOM_ID,
+      observation: recordedBoundary,
+      observationHash: computeObservationHash(recordedBoundary),
+      source: null,
+      promptPolicyId: seatPromptPolicy.id,
+      eventCursor: recordedBoundary.eventSeq,
+    });
+    const started = recordedStore.startAttempt(recorded.id, JSON.stringify({ placeholder: true }));
+    if (started.kind !== 'started') throw new Error('expected started');
+    recordedStore.recordAttemptResponse(recorded.id, started.attempt.id, {
+      status: 'SUCCEEDED',
+      responseJson: toolCallResponse({ actionId: 'act-show' }),
+      model: MODEL,
+      provider: PROVIDER,
+      promptPolicyId: seatPromptPolicy.id,
+      usage: { promptTokens: 10, completionTokens: 2, costMicroUsd: 5, latencyMs: 1 },
+    });
+    const recordedHarness = makeHarness({
+      store: recordedStore,
+      script: () => {
+        throw new Error('provider must not be called');
+      },
+    });
+    recordedHarness.transport.observation = recordedBoundary;
+    await recordedHarness.runtime.start();
+
+    const committedRecord = expectStatus(recordedStore, TEST_TABLE_ID, 'turn-recorded-show');
+    expect(committedRecord.status).toBe('COMMITTED');
+    expect(recordedHarness.provider.invocations).toBe(0);
+    expect(recordedHarness.transport.actionRequests).toHaveLength(1);
+    expect(recordedHarness.transport.actionRequests[0]!.actionId).toBe('act-show');
+    expect(recordedHarness.transport.actionRequests[0]!.turnId).toBe('turn-recorded-show');
+    expect(recordedHarness.transport.actionRequests[0]!.amount).toBeUndefined();
+    expect(recordedHarness.transport.fetchChatCalls).toBe(0);
+
+    // A stored canonical request (already submitted) replays the same way,
+    // bypassing the provider stage entirely.
+    const submittedStore = new MemoryDecisionStore();
+    const submittedBoundary = showBoundary({
+      turnId: 'turn-submitted-show',
+      version: 5,
+      eventSeq: 11,
+    });
+    const submitted = submittedStore.observeDecision({
+      tableId: TEST_TABLE_ID,
+      turnId: submittedBoundary.turnId,
+      principalId: PRINCIPAL,
+      roomId: ROOM_ID,
+      observation: submittedBoundary,
+      observationHash: computeObservationHash(submittedBoundary),
+      source: null,
+      promptPolicyId: seatPromptPolicy.id,
+      eventCursor: submittedBoundary.eventSeq,
+    });
+    const submittedStart = submittedStore.startAttempt(
+      submitted.id,
+      JSON.stringify({ placeholder: true }),
+    );
+    if (submittedStart.kind !== 'started') throw new Error('expected started');
+    submittedStore.recordAttemptResponse(submitted.id, submittedStart.attempt.id, {
+      status: 'SUCCEEDED',
+      responseJson: toolCallResponse({ actionId: 'act-show' }),
+      model: MODEL,
+      provider: PROVIDER,
+      promptPolicyId: seatPromptPolicy.id,
+      usage: { promptTokens: 10, completionTokens: 2, costMicroUsd: 5, latencyMs: 1 },
+    });
+    submittedStore.submitResolvedAction(
+      submitted.id,
+      JSON.stringify({
+        requestId: submitted.id,
+        turnId: submittedBoundary.turnId,
+        expectedVersion: submittedBoundary.version,
+        actionId: 'act-show',
+      }),
+    );
+    const submittedHarness = makeHarness({
+      store: submittedStore,
+      script: () => {
+        throw new Error('provider must not be called');
+      },
+    });
+    submittedHarness.transport.observation = submittedBoundary;
+    await submittedHarness.runtime.start();
+
+    const committedSubmit = expectStatus(submittedStore, TEST_TABLE_ID, 'turn-submitted-show');
+    expect(committedSubmit.status).toBe('COMMITTED');
+    expect(submittedHarness.provider.invocations).toBe(0);
+    expect(submittedHarness.transport.actionRequests).toHaveLength(1);
+    expect(submittedHarness.transport.actionRequests[0]!.actionId).toBe('act-show');
+    expect(submittedHarness.transport.fetchChatCalls).toBe(0);
   });
 });
 

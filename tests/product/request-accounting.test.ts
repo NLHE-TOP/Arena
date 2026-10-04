@@ -427,6 +427,40 @@ function shapeOfAgent(shape: ShapeSpec, index: number): string {
 }
 
 /**
+ * Drain the in-process decision pipeline without depending on event-loop
+ * scheduling. The simulated transport and provider resolve in-process and the
+ * product store is synchronous SQLite, so progress is microtask-only; a
+ * `setTimeout(0)` yield here would stretch under parallel CI/Docker load and
+ * inflate the test's wall time without changing any assertion.
+ */
+async function drainMicrotasks(turns = 200): Promise<void> {
+  for (let turn = 0; turn < turns; turn += 1) await Promise.resolve();
+}
+
+/**
+ * Wait until `expected` decisions for one room are durably committed. The
+ * bounded attempt count is a structural guard, not a wall-clock budget; the
+ * macrotask safety valve only exists for a hypothetical stream-internal turn
+ * (the in-process fake response body is read without real I/O).
+ */
+async function settleCommittedDecisions(
+  store: ProductStore,
+  roomId: string,
+  expected: number,
+): Promise<number> {
+  let committed = 0;
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    committed = store.listDecisions({ roomId, status: 'COMMITTED' }).length;
+    if (committed >= expected) return committed;
+    await drainMicrotasks();
+    if (attempt % 20 === 19) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+  return committed;
+}
+
+/**
  * Run every shape in one shared product store over a single simulated minute.
  * `activeCadence` additionally models the 30s ACTIVE reconciliation cadence at
  * exactly +30s and +60s, which requires the caller to have faked `Date`.
@@ -595,17 +629,16 @@ async function runVirtualMinute(
             );
           }
         }
-        await new Promise((resolve) => setTimeout(resolve, 0));
+        await drainMicrotasks();
       }
 
       // Wait for this run's decisions before the next run starts delivering,
       // so provider attribution stays per shape.
-      let committed = 0;
-      for (let attempt = 0; attempt < 100_000; attempt += 1) {
-        committed = store.listDecisions({ roomId: run.roomId, status: 'COMMITTED' }).length;
-        if (committed >= run.shape.agentCount) break;
-        await new Promise((resolve) => setTimeout(resolve, 0));
-      }
+      const committed = await settleCommittedDecisions(
+        store,
+        run.roomId,
+        run.shape.agentCount,
+      );
       expect(committed).toBe(run.shape.agentCount);
       run.providerBefore = providerBefore;
       run.providerAfter = providerCalls;

@@ -23,6 +23,12 @@ No poker rules, prompts, provider caps, or custody/ledger terms are changed.
   five-second per-agent observation poll.
 - Resolve pending durable work before considering a fresh turn. Existing stored
   successful responses, canonical requests, and receipt replay remain unchanged.
+- A fresh provider decision requires the canonical `state.actionTo` to identify
+  the viewing player. Full snapshots can expose legal SHOW/MUCK/DEAL controls
+  with no acting player; these are not new betting turns. Do not spend provider,
+  chat, or action requests on them. The platform owns automatic next-hand
+  progression. Previously stored successful control responses/actions still
+  resolve/replay through the durable path before this fresh-turn guard.
 - Fetch bounded public chat only for a newly observed decision; existing
   decisions and duplicate observations do not fetch chat.
 
@@ -100,6 +106,15 @@ the bounded missing-agent recovery above fixes that NLHE transport-recovery
 defect without restarting healthy agents. The run then crashed in the new
 accounting proxy on an unhandled socket reset. Fault-injection-tested proxy
 hardening was required before repeating the complete accounting matrix.
+
+Candidate gameplay exposed another consumer-amplification path: 42 decisions
+in a 41-second 1H1A room, including repeated SHOW/DEAL at SHOWDOWN with
+`actionTo=null`. Those control actions advanced versions, invalidated scheduled
+next-hand work, consumed nearly all of one principal's application budget, and
+eventually caused an expiry/reconnect storm in a stalled 10A room. The fresh
+acting-viewer boundary above removes this feedback loop without changing the
+server menu, model/prompt policy, rules, or provider caps. That candidate run is
+a FAIL artifact, not release acceptance.
 
 ## Acceptance status
 

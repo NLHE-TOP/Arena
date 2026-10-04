@@ -771,7 +771,7 @@ export class AgentRuntime {
       await this.driveDecision(decision, current);
     }
 
-    if (current === null || current.legalActions.length === 0) return;
+    if (current === null || current.legalActions.length === 0 || !this.isActingViewer(current)) return;
     await this.observeAndDrive(room, current);
   }
 
@@ -1012,6 +1012,16 @@ export class AgentRuntime {
       observation = this.canonicalObservationOf(decision);
     } catch (error) {
       this.markFailed(decision, `observation_integrity_failure:${describeError(error)}`);
+      return false;
+    }
+
+    // A full observation can advertise legal SHOW/MUCK/DEAL controls when
+    // there is no betting actor. Those are not fresh agent turns. In
+    // particular, repeated SHOW boundaries must not create a provider/HTTP
+    // feedback loop or race the platform-owned next-hand worker. Recorded
+    // successful responses and canonical requests are replayed before here.
+    if (!this.isActingViewer(observation)) {
+      this.markStale(decision, 'non_acting_boundary');
       return false;
     }
 
@@ -1801,6 +1811,12 @@ export class AgentRuntime {
    * Seat-scoped observation guard. `null` means the observation may be used;
    * otherwise the returned reason names the rejected identity.
    */
+  private isActingViewer(observation: CanonicalSeatObservation): boolean {
+    const actor = observation.state.actionTo;
+    return actor !== null &&
+      observation.state.players[actor]?.id === observation.state.viewingPlayerId;
+  }
+
   private viewingPlayerGuard(
     room: AgentRoomBinding,
     observation: CanonicalSeatObservation,
