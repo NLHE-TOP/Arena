@@ -81,8 +81,17 @@
  * Usage:
  *   NLHE_IT_STAGING_FIXTURE=<abs path to staging-platform.mjs> \
  *     tsx tests/integration/request-budget.ts [--smoke] [--scenarios a,b] \
- *     [--mixed-pair 2H2A,2H2A] [--max-wait-ms N] [--json <path>] [--keep] \
- *     [--self-test]
+ *     [--mixed-pair 2H2A,2H2A] [--max-wait-ms N] [--wallet-only] \
+ *     [--json <path>] [--keep] [--self-test]
+ *
+ * `--wallet-only` appends ONE optional pure-WALLET 2H scenario after the
+ * selected scenarios, reusing the existing human pool sessions (`humans[0..1]`,
+ * no additional nonce/login or identity hack). The mandatory PhaseC required
+ * list stays the four scenarios and `--scenarios` still selects only those
+ * four; the wallet-only room runs through the existing `runProductRoom`
+ * authority and documented human pacing, and must record exactly 0 provider
+ * requests (no agent seats). Readiness, metrics and numeric throttle headroom
+ * for that room are reported under `walletOnly`.
  *
  * --smoke runs only `fresh-1H1A` (the targeted cheap PhaseC scenario).
  * --self-test exercises the proxy/categorization/bucketing math offline
@@ -126,8 +135,16 @@ import { ProductClient } from './acceptance/product-client.js';
 import { HUMAN_DRIVER_PACING, runProductRoom, type HumanDriverStats } from './acceptance/product-room.js';
 import { ROSTER_MATRIX, type RosterSpec } from './acceptance/roster.js';
 
-const SCENARIO_NAMES = ['fresh-1H1A', '10A', '1H9A', 'mixed-pair'] as const;
-type ScenarioName = (typeof SCENARIO_NAMES)[number];
+/** Mandatory PhaseC scenarios (required list never changes). */
+const REQUIRED_SCENARIO_NAMES = ['fresh-1H1A', '10A', '1H9A', 'mixed-pair'] as const;
+type RequiredScenarioName = (typeof REQUIRED_SCENARIO_NAMES)[number];
+/** Optional appended scenarios (never part of the required four). */
+const WALLET_ONLY_SCENARIO = 'wallet-only' as const;
+type ScenarioName = RequiredScenarioName | typeof WALLET_ONLY_SCENARIO;
+
+/** Exact published PokerTools 2.0.0 image digest (never env-overridable). */
+const PUBLISHED_PLATFORM_2_0_0_IMAGE =
+  'ghcr.io/aaurelions/pokertools@sha256:b0764ca686b65ecb77905df198536d2eb3560264db58176fe8cdc04a6bc77d71';
 
 const HUMAN_POOL_SIZE = 4;
 const AGENT_POOL_SIZE = 10;
@@ -136,11 +153,16 @@ interface BudgetArgs {
   smoke: boolean;
   selfTest: boolean;
   keep: boolean;
-  scenarios: ScenarioName[] | null;
+  scenarios: RequiredScenarioName[] | null;
   mixedPair: [string, string];
   jsonPath: string | null;
   /** Diagnostic wait only (runProductRoom maxWaitMs); never a provider cap. */
   maxWaitMs: number;
+  /**
+   * Append the optional pure-WALLET 2H scenario after the selected scenarios.
+   * It reuses the existing human pool sessions; the required four stay as-is.
+   */
+  walletOnly: boolean;
 }
 
 /** Default diagnostic wait: unchanged from the acceptance harness. */
@@ -174,6 +196,7 @@ function parseArgs(argv: readonly string[]): BudgetArgs {
     mixedPair: ['2H2A', '2H2A'],
     jsonPath: null,
     maxWaitMs: DEFAULT_DIAGNOSTIC_MAX_WAIT_MS,
+    walletOnly: false,
   };
   const value = (index: number, flag: string): string => {
     const next = argv[index + 1];
@@ -192,6 +215,9 @@ function parseArgs(argv: readonly string[]): BudgetArgs {
       case '--keep':
         args.keep = true;
         break;
+      case '--wallet-only':
+        args.walletOnly = true;
+        break;
       case '--max-wait-ms': {
         const raw = value(index, '--max-wait-ms');
         index += 1;
@@ -204,11 +230,13 @@ function parseArgs(argv: readonly string[]): BudgetArgs {
         const names = raw.split(',').map((entry) => entry.trim()).filter(Boolean);
         if (names.length === 0) throw new Error('--scenarios requires at least one scenario name');
         for (const name of names) {
-          if (!SCENARIO_NAMES.includes(name as ScenarioName)) {
-            throw new Error(`unknown scenario ${name}; expected one of ${SCENARIO_NAMES.join(', ')}`);
+          // `--scenarios` selects only the required four; the optional
+          // wallet-only scenario is appended exclusively via --wallet-only.
+          if (!REQUIRED_SCENARIO_NAMES.includes(name as RequiredScenarioName)) {
+            throw new Error(`unknown scenario ${name}; expected one of ${REQUIRED_SCENARIO_NAMES.join(', ')}`);
           }
         }
-        args.scenarios = names as ScenarioName[];
+        args.scenarios = names as RequiredScenarioName[];
         break;
       }
       case '--mixed-pair': {
@@ -244,8 +272,9 @@ interface ScenarioPlan {
 }
 
 function resolveScenarioPlans(args: BudgetArgs): ScenarioPlan[] {
-  const names = args.scenarios ?? (args.smoke ? (['fresh-1H1A'] as ScenarioName[]) : [...SCENARIO_NAMES]);
-  return names.map((name) => {
+  const names: RequiredScenarioName[] =
+    args.scenarios ?? (args.smoke ? ['fresh-1H1A'] : [...REQUIRED_SCENARIO_NAMES]);
+  const plans: ScenarioPlan[] = names.map((name) => {
     if (name === 'mixed-pair') {
       const rosters = [roster(args.mixedPair[0]), roster(args.mixedPair[1])];
       for (const spec of rosters) {
@@ -257,6 +286,13 @@ function resolveScenarioPlans(args: BudgetArgs): ScenarioPlan[] {
     }
     return { name, rosters: [roster(name === 'fresh-1H1A' ? '1H1A' : name)] };
   });
+  if (args.walletOnly) {
+    // Optional pure-WALLET 2H gameplay appended after the selected scenarios;
+    // it reuses the existing human pool sessions (no new nonce/login) and
+    // never joins the required-four list.
+    plans.push({ name: WALLET_ONLY_SCENARIO, rosters: [roster('2H')] });
+  }
+  return plans;
 }
 
 interface RoomRunRecord {
@@ -644,9 +680,9 @@ async function runBudget(args: BudgetArgs): Promise<number> {
     sanitize = (value) => topology!.secretRegistry.redact(value);
     context.log(`platform image: ${topology.platformImage}`);
     context.log(
-      topology.platformImage === DEFAULT_PLATFORM_IMAGE
+      topology.platformImage === PUBLISHED_PLATFORM_2_0_0_IMAGE
         ? 'platform image is the published 2.0.0 pinned digest'
-        : 'WARNING: platform image differs from the published 2.0.0 pinned digest'
+        : 'external platform override: publication/version must be verified separately (not a 2.0.0 claim)'
     );
 
     // Authoritative baseline BEFORE operator/provisioning setup, so the setup
@@ -941,7 +977,7 @@ async function runBudget(args: BudgetArgs): Promise<number> {
     );
   const code = failure === null && accountingRecorded ? 0 : 1;
 
-  const requiredScenarios = [...SCENARIO_NAMES];
+  const requiredScenarios = [...REQUIRED_SCENARIO_NAMES];
   const accountedScenarios = scenarios
     .filter(
       (scenario) =>
@@ -958,6 +994,8 @@ async function runBudget(args: BudgetArgs): Promise<number> {
   const contaminatedScenarios = scenarios
     .filter((scenario) => scenario.contamination.budgetIsolation === 'contaminated')
     .map((scenario) => scenario.name);
+  const walletOnlyRecord = scenarios.find((scenario) => scenario.name === WALLET_ONLY_SCENARIO) ?? null;
+  const walletOnlyRoom = walletOnlyRecord?.rooms[0] ?? null;
 
   context.log('---- PhaseC request accounting summary ----');
   for (const scenario of scenarios) {
@@ -1000,7 +1038,8 @@ async function runBudget(args: BudgetArgs): Promise<number> {
     phase: 'C',
     kind: 'unpaid-request-accounting',
     platformImage: topology?.platformImage ?? process.env.NLHE_IT_PLATFORM_IMAGE ?? null,
-    platformImagePinnedDefault: (topology?.platformImage ?? null) === DEFAULT_PLATFORM_IMAGE,
+    platformImageMatchesConfiguredDefault: (topology?.platformImage ?? null) === DEFAULT_PLATFORM_IMAGE,
+    platformIsPublished2_0_0: topology?.platformImage === PUBLISHED_PLATFORM_2_0_0_IMAGE,
     platformPatchNote:
       'accounting is bound to the platform image above; do not compare across different platform images',
     product: {
@@ -1023,6 +1062,11 @@ async function runBudget(args: BudgetArgs): Promise<number> {
       maxProviderConcurrency: 8,
       agentChat: 'enabled (unchanged)',
       note: 'exact deterministic acceptance settings (tests/integration/acceptance/run.ts); provider caps are never raised for this diagnostic',
+    },
+    platformLimits: {
+      appRequestsPerMinute: 100,
+      networkRequestsPerMinute: 1000,
+      note: 'production defaults preserved; the legacy runProductionAcceptance.sh 100000 override is never used',
     },
     scenarioPlans: plans.map((plan) => ({ name: plan.name, rosters: plan.rosters.map((spec) => spec.label) })),
     accountingSource: {
@@ -1061,6 +1105,12 @@ async function runBudget(args: BudgetArgs): Promise<number> {
       allFourAccounted,
       completedScenarios,
       allFourCompleted,
+      optionalScenarios: args.walletOnly ? [WALLET_ONLY_SCENARIO] : [],
+      optionalAccountedScenarios: walletOnlyRecord !== null && walletOnlyRecord.authoritative !== null ? [WALLET_ONLY_SCENARIO] : [],
+      optionalCompletedScenarios:
+        walletOnlyRecord !== null && walletOnlyRecord.rooms.length > 0 && walletOnlyRecord.rooms.every((room) => room.error === null)
+          ? [WALLET_ONLY_SCENARIO]
+          : [],
       zero429Gate: 'disabled: 429 counts are diagnostic evidence only and never gate the platform patch decision by themselves',
       semantics: {
         accounted:
@@ -1073,6 +1123,36 @@ async function runBudget(args: BudgetArgs): Promise<number> {
     contaminationSummary: {
       contaminatedScenarios,
       note: 'a scenario is contaminated when an earlier scenario left a room non-terminal; its budget then also carries that room\'s traffic and is never claimed isolated',
+    },
+    walletOnly: {
+      requested: args.walletOnly,
+      scenario: WALLET_ONLY_SCENARIO,
+      present: walletOnlyRecord !== null,
+      accounted: walletOnlyRecord !== null ? walletOnlyRecord.authoritative !== null : null,
+      completed:
+        walletOnlyRecord === null
+          ? null
+          : walletOnlyRecord.rooms.length > 0 && walletOnlyRecord.rooms.every((room) => room.error === null),
+      roomStatus: walletOnlyRoom?.status ?? null,
+      roomReadiness:
+        walletOnlyRoom === null ? null : walletOnlyRoom.status === 'COMPLETE' ? 'COMPLETE' : walletOnlyRoom.status,
+      providerRequests: walletOnlyRoom?.providerRequests ?? null,
+      zeroProviderRequests:
+        walletOnlyRoom === null || walletOnlyRoom.providerRequests === null
+          ? null
+          : walletOnlyRoom.providerRequests === 0,
+      humanDriver: walletOnlyRoom?.humanDriver ?? null,
+      metrics:
+        walletOnlyRecord === null
+          ? null
+          : {
+              proxyCoveredTotal: walletOnlyRecord.accounting.combined.total,
+              status429: walletOnlyRecord.accounting.combined.status429,
+              perMinute: walletOnlyRecord.accounting.combined.perMinute,
+              peakRolling60s: walletOnlyRecord.accounting.combined.peakRolling60s,
+            },
+      headroom: walletOnlyRecord?.accounting.combined.throttle ?? null,
+      note: 'optional pure-WALLET 2H gameplay from the existing human pool (no additional nonce/login or identity hack); expected 0 provider requests and 0 agent decisions',
     },
     limitations: [
       'per-minute buckets are relative to each scenario start; empty minutes are retained',
@@ -1782,6 +1862,76 @@ async function runSelfTest(): Promise<number> {
       JSON.stringify(contaminationSample)
     );
 
+    // Optional --wallet-only scenario: appended fifth, required four unchanged.
+    check(
+      'required PhaseC list stays four and excludes wallet-only',
+      REQUIRED_SCENARIO_NAMES.length === 4 &&
+        !(REQUIRED_SCENARIO_NAMES as readonly string[]).includes(WALLET_ONLY_SCENARIO)
+    );
+    const defaultArgs: BudgetArgs = {
+      smoke: false,
+      selfTest: false,
+      keep: false,
+      scenarios: null,
+      mixedPair: ['2H2A', '2H2A'],
+      jsonPath: null,
+      maxWaitMs: DEFAULT_DIAGNOSTIC_MAX_WAIT_MS,
+      walletOnly: false,
+    };
+    const defaultPlans = resolveScenarioPlans(defaultArgs);
+    check(
+      'default scenario plans unchanged without --wallet-only',
+      defaultPlans.length === 4 &&
+        defaultPlans.map((plan) => plan.name).join(',') === REQUIRED_SCENARIO_NAMES.join(',')
+    );
+    const walletPlans = resolveScenarioPlans({ ...defaultArgs, walletOnly: true });
+    check(
+      '--wallet-only appends exactly one 2H scenario',
+      walletPlans.length === 5 &&
+        walletPlans[4]!.name === 'wallet-only' &&
+        walletPlans[4]!.rosters.length === 1 &&
+        walletPlans[4]!.rosters[0]!.label === '2H' &&
+        REQUIRED_SCENARIO_NAMES.every((name) => walletPlans.some((plan) => plan.name === name)),
+      JSON.stringify(
+        walletPlans.map((plan) => `${plan.name}[${plan.rosters.map((spec) => spec.label).join('+')}]`)
+      )
+    );
+    const smokeWalletPlans = resolveScenarioPlans({ ...defaultArgs, smoke: true, walletOnly: true });
+    check(
+      '--smoke --wallet-only runs fresh-1H1A plus wallet-only',
+      smokeWalletPlans.length === 2 &&
+        smokeWalletPlans[0]!.name === 'fresh-1H1A' &&
+        smokeWalletPlans[1]!.name === 'wallet-only'
+    );
+    check(
+      '--scenarios cannot select wallet-only',
+      (() => {
+        try {
+          parseArgs(['--scenarios', 'wallet-only']);
+          return false;
+        } catch (error) {
+          return errorText(error).includes('unknown scenario');
+        }
+      })()
+    );
+    const walletArgs = parseArgs(['--wallet-only']);
+    check(
+      '--wallet-only parses as a flag without changing scenario selection',
+      walletArgs.walletOnly === true && walletArgs.scenarios === null
+    );
+    const dummyHumans = [{ token: 'h1' }, { token: 'h2' }] as unknown as WalletSession[];
+    const walletRooms = planRooms(walletPlans[4]!, dummyHumans, []);
+    check(
+      'wallet-only room reuses human pool [0..1] and allocates no agents',
+      walletRooms.length === 1 &&
+        walletRooms[0]!.label === '2H' &&
+        walletRooms[0]!.humans.length === 2 &&
+        walletRooms[0]!.humans[0] === dummyHumans[0] &&
+        walletRooms[0]!.humans[1] === dummyHumans[1] &&
+        walletRooms[0]!.agentIds.length === 0,
+      JSON.stringify(walletRooms.map((room) => ({ label: room.label, humans: room.humans.length, agents: room.agentIds.length })))
+    );
+
     const synthetic = [
       { at: 0, method: 'GET', route: '/tables/:id/observation', category: 'observation' as const, status: 200, durationMs: 1, throttle: null },
       { at: 59_999, method: 'GET', route: '/tables/:id/observation', category: 'observation' as const, status: 200, durationMs: 1, throttle: null },
@@ -1823,7 +1973,7 @@ async function main(): Promise<number> {
   } catch (error) {
     console.error(errorText(error));
     console.error(
-      'usage: tsx tests/integration/request-budget.ts [--smoke] [--scenarios fresh-1H1A,10A,1H9A,mixed-pair] [--mixed-pair 2H2A,2H2A] [--max-wait-ms N] [--json <path>] [--keep] [--self-test]'
+      'usage: tsx tests/integration/request-budget.ts [--smoke] [--scenarios fresh-1H1A,10A,1H9A,mixed-pair] [--mixed-pair 2H2A,2H2A] [--max-wait-ms N] [--wallet-only] [--json <path>] [--keep] [--self-test]'
     );
     return 2;
   }
