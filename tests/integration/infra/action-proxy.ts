@@ -34,6 +34,9 @@ export interface ActionProxyHandle {
   holdNextCancellationResponse(): void;
   competitionStartRequests: () => number;
   heldResponses: () => number;
+  heldActionRequestId: () => string | null;
+  heldActionReceipt: () => unknown;
+  delayedActionRequestId: () => string | null;
   releaseHeld: () => void;
   actionRequests: () => number;
   stop: () => Promise<void>;
@@ -48,6 +51,9 @@ export async function startActionProxy(targetBaseUrl: string): Promise<ActionPro
   const port = await freePort();
   let holdArmed = false;
   let delayArmedMs: number | null = null;
+  let delayedAction: { requestId: string; deadline: number } | null = null;
+  let heldRequestId: string | null = null;
+  let heldReceipt: unknown = null;
   let actionRequests = 0;
   let startDelayMs: number | null = null;
   let holdCancellation = false;
@@ -61,6 +67,13 @@ export async function startActionProxy(targetBaseUrl: string): Promise<ActionPro
     incoming.on('end', () => {
       const body = Buffer.concat(chunks);
       const action = isActionPath(path);
+      let requestId: string | null = null;
+      if (action) {
+        try {
+          const parsed = JSON.parse(body.toString('utf8')) as { requestId?: unknown };
+          if (typeof parsed.requestId === 'string') requestId = parsed.requestId;
+        } catch { /* Forward invalid bodies to the real platform unchanged. */ }
+      }
       const competitionStart = incoming.method === 'POST' && /^\/competitions\/[^/]+\/start$/.test(path);
       const cancellation = incoming.method === 'POST' && /^\/competitions\/[^/]+\/cancel$/.test(path);
       if (competitionStart) competitionStarts += 1;
@@ -85,8 +98,15 @@ export async function startActionProxy(targetBaseUrl: string): Promise<ActionPro
                 string,
                 string | string[] | undefined
               >;
-              if ((action && holdArmed) || (cancellation && holdCancellation)) {
-                if (action) holdArmed = false;
+              const accepted = (upstreamResponse.statusCode ?? 502) >= 200 && (upstreamResponse.statusCode ?? 502) < 300;
+              if (action && accepted && holdArmed && requestId !== null) {
+                holdArmed = false;
+                heldRequestId = requestId;
+                heldReceipt = (JSON.parse(responseBody.toString('utf8')) as { receipt?: unknown }).receipt ?? null;
+              }
+              // Retries of this canonical identity must not escape the crash
+              // window merely because the first response was already held.
+              if ((action && requestId !== null && requestId === heldRequestId) || (cancellation && holdCancellation)) {
                 if (cancellation) holdCancellation = false;
                 held.push({
                   response: outgoing,
@@ -115,10 +135,14 @@ export async function startActionProxy(targetBaseUrl: string): Promise<ActionPro
         setTimeout(forward, delayMs);
         return;
       }
-      if (action && delayArmedMs !== null) {
-        const delayMs = delayArmedMs;
+      if (action && requestId !== null && delayArmedMs !== null) {
+        delayedAction = { requestId, deadline: Date.now() + delayArmedMs };
         delayArmedMs = null;
-        setTimeout(forward, delayMs);
+      }
+      // The SDK retries canonical requests with the same identity. Delay all
+      // of them until the same deadline, not just the first HTTP attempt.
+      if (action && delayedAction?.requestId === requestId && delayedAction.deadline > Date.now()) {
+        setTimeout(forward, delayedAction.deadline - Date.now());
         return;
       }
       forward();
@@ -151,12 +175,19 @@ export async function startActionProxy(targetBaseUrl: string): Promise<ActionPro
     url: `http://127.0.0.1:${port}`,
     holdNextActionResponse: () => {
       holdArmed = true;
+      heldRequestId = null;
+      heldReceipt = null;
     },
     delayNextActionForward: (delayMs) => {
       delayArmedMs = delayMs;
+      delayedAction = null;
     },
     heldResponses: () => held.length,
+    heldActionRequestId: () => heldRequestId,
+    heldActionReceipt: () => heldReceipt,
+    delayedActionRequestId: () => delayedAction?.requestId ?? null,
     releaseHeld: () => {
+      heldRequestId = null;
       for (const entry of held.splice(0)) {
         try {
           if (!entry.response.writableEnded && !entry.response.destroyed) {
@@ -173,6 +204,8 @@ export async function startActionProxy(targetBaseUrl: string): Promise<ActionPro
     holdNextCancellationResponse: () => { holdCancellation = true; },
     competitionStartRequests: () => competitionStarts,
     stop: async () => {
+      holdArmed = false;
+      heldRequestId = null;
       for (const entry of held.splice(0)) entry.response.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     },

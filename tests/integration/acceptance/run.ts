@@ -18,6 +18,7 @@
  */
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { createRunContext, Report } from '../infra/context.js';
 import { startEnvironment } from '../infra/environment.js';
 import { probeProductSurface, surfaceReady, describeSurface } from '../infra/capabilities.js';
@@ -298,28 +299,35 @@ export async function runAcceptance(options: AcceptanceOptions): Promise<number>
           { name: `crash-${spec.label}-${Date.now().toString(36)}`, mode: 'SPONSORED', humanCount: 0, agentIds: agents.slice(0, 2).map((agent) => agent.agentId) },
           { admin: true }
         );
-        const started = await crashProduct.startRoom(room.id, { admin: true });
-        const tableId = started.pokerTableId;
-        if (tableId === null) throw new Error('crash room ACTIVE without a table');
+        // startRoom awaits runtime attachment and its first drain. Observe the
+        // accepted-action window concurrently, before that request can finish.
+        const starting = crashProduct.startRoom(room.id, { admin: true }).catch((error: unknown) => error);
 
         const submitted = await waitFor(
           'decision ACTION_SUBMITTED with a stored request',
           async () => {
             const evidence = readRoomEvidence(crashDb, room.id);
+            const heldRequestId = proxy.heldActionRequestId();
+            if (proxy.heldResponses() === 0 || heldRequestId === null) return null;
             return (
-              evidence.decisions.find((decision) => decision.status === 'ACTION_SUBMITTED' && decision.request_json !== null) ??
+              evidence.decisions.find((decision) => decision.status === 'ACTION_SUBMITTED' && decision.request_json !== null &&
+                (JSON.parse(decision.request_json) as { requestId: string }).requestId === heldRequestId) ??
               null
             );
           },
           { timeoutMs: 90_000, intervalMs: 150 }
         );
+        const tableId = submitted.table_id;
         const turnId = submitted.turn_id;
+        const acceptedReceiptBeforeCrash = proxy.heldActionReceipt();
+        if (acceptedReceiptBeforeCrash === null) throw new Error('crash window has no real accepted receipt');
         const providerBefore = environment.fakeProvider.requestCountForTurn(tableId, turnId);
         const attemptsBefore = readRoomEvidence(crashDb, room.id).attempts.filter(
           (attempt) => attempt.decision_id === submitted.id
         ).length;
         context.log('restart: SIGKILLing the actual NLHE process inside the accepted-action window...');
         await crash.kill();
+        await starting;
         proxy.releaseHeld();
         await crash.restart();
 
@@ -333,6 +341,9 @@ export async function runAcceptance(options: AcceptanceOptions): Promise<number>
           { timeoutMs: 120_000, intervalMs: 250 }
         );
         const evidence = readRoomEvidence(crashDb, room.id);
+        if (!isDeepStrictEqual(JSON.parse(committed.receipt_json!), acceptedReceiptBeforeCrash)) {
+          throw new Error('restart did not reuse the original accepted platform receipt');
+        }
         const attempts = evidence.attempts.filter((attempt) => attempt.decision_id === submitted.id);
         if (attempts.length !== 1 || attempts[0]!.status !== 'SUCCEEDED') {
           throw new Error(`expected exactly one SUCCEEDED provider attempt for the crashed decision, saw ${attempts.length}`);
@@ -367,11 +378,21 @@ export async function runAcceptance(options: AcceptanceOptions): Promise<number>
           }
         } else {
           const frame = await admin.client.getReplay(tableId, { fromEventSeq: 1 });
-          const acceptedEvents = frame.events.filter((event) =>
-            JSON.stringify(event.payload ?? {}).includes(requestId)
-          );
+          // v2.0.0 exposes accepted-action correlation on the replay event,
+          // not inside its masked public payload.
+          const acceptedEvents = frame.events.filter((event) => event.requestId === requestId);
           if (acceptedEvents.length !== 1) {
             throw new Error(`expected exactly one accepted action event for ${requestId}, saw ${acceptedEvents.length}`);
+          }
+          const request = JSON.parse(submitted.request_json!) as { actionId: string };
+          const receipt = JSON.parse(committed.receipt_json!) as { requestId: string; eventSeq: number; actionId: string };
+          const event = acceptedEvents[0]!;
+          // The receipt cursor includes events derived from the action (for
+          // example the next turn), not only the ACTION_APPLIED event itself.
+          if (!frame.chainValid || event.turnId !== turnId || event.actionId !== request.actionId ||
+              receipt.requestId !== requestId || receipt.actionId !== event.actionId || event.eventSeq > receipt.eventSeq ||
+              !frame.events.some(candidate => candidate.eventSeq === receipt.eventSeq)) {
+            throw new Error('recovered receipt does not identify the one authoritative accepted action');
           }
         }
         void committed;
@@ -388,16 +409,20 @@ export async function runAcceptance(options: AcceptanceOptions): Promise<number>
       const staleDb = join(context.artifactDir, 'nlhe-stale.sqlite');
       let staleNlhe: Awaited<ReturnType<typeof startNlhe>> | null = null;
       try {
+        const speechRoster = await writeFakeAgentRoster(context, { baseUrl: speechProvider.baseUrl, principals: agents });
         staleNlhe = await startNlhe(context, {
           platformBaseUrl: proxy.url,
           openaiBaseUrl: speechProvider.baseUrl,
           openaiApiKey: FIXTURE_API_KEY,
           openaiModel: FIXTURE_MODEL,
           databasePath: staleDb,
-          agentsConfigPath: roster.path,
+          agentsConfigPath: speechRoster.path,
           maxProviderCalls: 200,
           maxCostUsdMicro: 0,
-          perCallTimeoutMs: 5000,
+          // Two submission attempts must outlive the real 10s platform turn
+          // timeout and the 12s forwarding fence, so we observe STALE, not a
+          // transport timeout before the request ever reaches the platform.
+          perCallTimeoutMs: 8000,
           overallRuntimeMs: 300_000,
           maxHands: 20,
           extraEnv: {
@@ -424,7 +449,9 @@ export async function runAcceptance(options: AcceptanceOptions): Promise<number>
           'STALE decision with a completed provider attempt',
           async () => {
             const evidence = readRoomEvidence(staleDb, room.id);
-            return evidence.decisions.find((decision) => decision.status === 'STALE' && decision.request_json !== null) ?? null;
+            const delayedRequestId = proxy.delayedActionRequestId();
+            return evidence.decisions.find((decision) => decision.status === 'STALE' && decision.request_json !== null &&
+              (JSON.parse(decision.request_json) as { requestId: string }).requestId === delayedRequestId) ?? null;
           },
           { timeoutMs: 120_000, intervalMs: 250 }
         );
@@ -433,10 +460,25 @@ export async function runAcceptance(options: AcceptanceOptions): Promise<number>
         if (attempts.length !== 1 || attempts[0]!.status !== 'SUCCEEDED') {
           throw new Error(`stale decision attempts are not one SUCCEEDED provider exchange: ${JSON.stringify(attempts.map((a) => a.status))}`);
         }
+        if (speechProvider.requestCountForTurn(tableId, staleDecision.turn_id) !== 1) {
+          throw new Error('stale turn did not use the dedicated speech provider exactly once');
+        }
+        const completion = JSON.parse(attempts[0]!.response_json!) as {
+          choices: Array<{ message: { tool_calls: Array<{ function: { arguments: string } }> } }>;
+        };
+        const speech = (JSON.parse(completion.choices[0]!.message.tool_calls[0]!.function.arguments) as { speech?: string }).speech;
+        if (typeof speech !== 'string' || !/^fake-table-speech-\d+$/.test(speech)) {
+          throw new Error('delayed stale action did not carry its deterministic speech');
+        }
         const requestId = (JSON.parse(staleDecision.request_json!) as { requestId: string }).requestId;
         const frame = await admin.client.getReplay(tableId, { fromEventSeq: 1 });
-        const accepted = frame.events.filter((event) => JSON.stringify(event.payload ?? {}).includes(requestId));
+        const accepted = frame.events.filter((event) => event.requestId === requestId);
         if (accepted.length !== 0) throw new Error('the stale request mutated the table');
+        const observation = JSON.parse(staleDecision.observation_json) as { version: number };
+        const winningMutation = frame.events.filter(event => event.type === 'ACTION_APPLIED' && event.version === observation.version + 1);
+        if (!frame.chainValid || winningMutation.length !== 1) {
+          throw new Error('the timed-out turn did not have exactly one authoritative winning mutation');
+        }
         await waitFor(
           'next COMMITTED decision after the stale turn',
           async () => {
@@ -445,8 +487,11 @@ export async function runAcceptance(options: AcceptanceOptions): Promise<number>
           },
           { timeoutMs: 120_000, intervalMs: 250 }
         );
+        const recoveredFrame = await admin.client.getReplay(tableId, { fromEventSeq: 1 });
+        const chatEvents = recoveredFrame.events.filter((event) => event.type === 'CHAT_MESSAGE');
+        const chat = await admin.client.getChat(tableId, { limit: 100 });
+        if (chat.messages.some(message => message.body === speech)) throw new Error('the stale decision published its speech');
         const committed = readRoomEvidence(staleDb, room.id).decisions.filter((decision) => decision.status === 'COMMITTED');
-        const chatEvents = frame.events.filter((event) => event.type === 'TABLE_CHAT');
         if (chatEvents.length > committed.length) {
           throw new Error(`chat events ${chatEvents.length} exceed committed decisions ${committed.length}: a stale decision spoke`);
         }
