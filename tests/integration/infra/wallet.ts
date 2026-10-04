@@ -7,7 +7,12 @@
  * login and bearer-token storage.
  */
 import { createSiweMessage, PokerClient } from '@pokertools/sdk';
-import { generatePrivateKey, privateKeyToAccount, type PrivateKeyAccount } from 'viem/accounts';
+import { generatePrivateKey, mnemonicToAccount, privateKeyToAccount, type PrivateKeyAccount } from 'viem/accounts';
+
+/** Standard public Anvil test mnemonic; never use these accounts with value. */
+export function getAccount(addressIndex: number) {
+  return mnemonicToAccount('test test test test test test test test test test test junk', { addressIndex });
+}
 
 export interface EphemeralWallet {
   account: PrivateKeyAccount;

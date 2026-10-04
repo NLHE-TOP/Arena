@@ -13,10 +13,6 @@ import { fileURLToPath } from 'node:url';
 
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 export const INTEGRATION_DIR = join(ROOT, 'tests', 'integration');
-export const POKERTOOLS_DIR = join(ROOT, 'pokertools');
-export const PLATFORM_API_DIR = join(POKERTOOLS_DIR, 'packages', 'api');
-export const PLATFORM_SDK_DIR = join(POKERTOOLS_DIR, 'packages', 'sdk');
-export const PLATFORM_TYPES_DIR = join(POKERTOOLS_DIR, 'packages', 'types');
 
 export interface RunContext {
   runId: string;
@@ -24,9 +20,9 @@ export interface RunContext {
   logDir: string;
   /** Keep disposable containers/processes alive for inspection. */
   keep: boolean;
-  /** Build policy for platform/NLHE artifacts. */
+  /** Build policy for NLHE artifacts only. */
   build: 'auto' | 'force' | 'never';
-  /** External topology override; empty values mean "provision locally". */
+  /** Operator-started disposable PokerTools 2.0.0 test deployment. */
   external: {
     platformUrl?: string;
     databaseUrl?: string;

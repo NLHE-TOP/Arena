@@ -5,7 +5,7 @@
  * `CompetitionClient` with a real orchestration credential.
  *
  * Part 2: the mandatory valueless ASSET challenge. It runs on the real
- * topology provisioned by `startFinancialTopology` (real Anvil, in-tree
+ * external topology configured by `startFinancialTopology` (real Anvil,
  * MockUSDC, two quorum proxies, declared Asset/sponsor fixtures backed by the
  * deployed token, actual custody worker heartbeats + reconciliation). Balances
  * come only from real on-chain transfers claimed through the public
@@ -21,7 +21,7 @@ import type { WalletSession } from '../infra/wallet.js';
 import { loginWallet } from '../infra/wallet.js';
 import type { ProvisionedAgent } from '../infra/agents.js';
 import type { FakeProviderHandle } from '../infra/fake-provider.js';
-import { getAccount } from '../../../pokertools/packages/e2e/tests/finance/helpers/anvil-two-chain.js';
+import { getAccount } from '../infra/wallet.js';
 import type { ProductClient } from './product-client.js';
 import { runProductRoom } from './product-room.js';
 import { ROSTER_MATRIX } from './roster.js';
@@ -131,7 +131,7 @@ export async function runAnvilChallenge(input: FinancialChallengeInput): Promise
   const financial = input.environment.financial;
   if (!financial) {
     throw new Error(
-      'blocked: the valueless Anvil challenge requires NLHE_IT_ANVIL=1 so the harness provisions the real topology (Anvil + MockUSDC + quorum proxies + custody worker) before the platform starts'
+      'blocked: the valueless Anvil challenge requires NLHE_IT_ANVIL=1 and an external real financial test deployment with NLHE_IT_FINANCE_FIXTURE (Anvil + MockUSDC + quorum proxies + custody worker)'
     );
   }
   const platformBaseUrl = input.environment.platform.baseUrl;

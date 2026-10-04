@@ -87,9 +87,9 @@ Only the public `@pokertools/sdk` and `@pokertools/types` packages are imported;
 Requires Node.js ^24.15.0 or >=26 and npm >=12.2.0, matching PokerTools 2.0.0.
 
 `@pokertools/sdk` and `@pokertools/types` are installed from npm at exactly
-`2.0.0`. Ordinary installation and container builds require no local platform
-build. The `./pokertools` checkout remains the frozen platform runtime for
-integration tests, not a package dependency.
+`2.0.0`. PokerTools is deployed separately; installation and container builds
+use only the published packages. Real integration tests target an externally
+started PokerTools 2.0.0 test deployment.
 
 ```bash
 # in this repository
@@ -138,6 +138,5 @@ and custody operations.
 
 The image contains only the product server — never the PokerTools API,
 PostgreSQL, Redis, custody or any secret. It installs SDK/types `2.0.0` from npm
-through `npm ci`; the local `pokertools/` checkout is excluded from the build
-context. The deployment shape is documented in
+through `npm ci`. The deployment shape is documented in
 [docs/OPERATIONS.md](docs/OPERATIONS.md).

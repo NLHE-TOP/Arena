@@ -60,7 +60,7 @@ import { ProductApiError, ProductClient, type ProductRoomView } from './acceptan
 import { readRoomEvidence, inspectRoomEvidence } from './acceptance/evidence.js';
 import { driveHumanSeats } from './acceptance/product-room.js';
 import type { FinancialTopology } from './infra/anvil-finance.js';
-import { getAccount } from '../../pokertools/packages/e2e/tests/finance/helpers/anvil-two-chain.js';
+import { getAccount } from './infra/wallet.js';
 
 /** Fixed, conservative live bounds. Never loosened at runtime. */
 export const LIVE_CAPS = Object.freeze({

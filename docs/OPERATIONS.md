@@ -147,14 +147,13 @@ secret. The agent catalog is supplied at runtime (mount it at
 `AGENTS_CONFIG_PATH`); the image contains no catalog and no secrets.
 
 `@pokertools/{types,sdk}` are installed from npm at exactly `2.0.0` through
-`npm ci`. No local SDK/types build is required; the entire `pokertools/`
-checkout is excluded from the Docker build context:
+`npm ci`. PokerTools is deployed separately; no local SDK/types build is required:
 
 ```bash
 docker build -t nlhe-product:0.3.0 .
 ```
 
-The local frozen checkout is still used as the integration platform runtime.
+Integration tests target an externally started PokerTools 2.0.0 test deployment.
 The full-stack compose/runbook lives with the platform.
 
 ## Explicitly not provided

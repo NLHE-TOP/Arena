@@ -5,7 +5,7 @@
 # embedded or started here.
 #
 # @pokertools/{types,sdk} are installed from npm at exactly 2.0.0.
-# The local platform checkout is excluded from the build context:
+# Build the standalone product image:
 #   docker build -t nlhe-product:0.3.0 .
 
 FROM node:24-slim AS base

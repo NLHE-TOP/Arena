@@ -14,10 +14,10 @@ for (const root of ['src', 'web']) {
     const source = await readFile(file, 'utf8');
     for (const match of source.matchAll(/(?:from\s*|import\s*\(|require\s*\()\s*['"]([^'"]+)/g)) {
       const specifier = match[1];
-      if (specifier.startsWith('@pokertools/') && !['@pokertools/sdk', '@pokertools/types', '@pokertools/sdk/react'].includes(specifier)) {
+      if (specifier.startsWith('@pokertools/') && !['@pokertools/sdk', '@pokertools/types'].includes(specifier)) {
         errors.push(`${file}: private platform dependency ${specifier}`);
       }
-      if (/pokertools\/(?:packages|src)|prisma/i.test(specifier)) errors.push(`${file}: platform persistence/source import`);
+      if (/(?:^|\/)pokertools(?:-arena)?(?:\/|$)|prisma/i.test(specifier)) errors.push(`${file}: platform persistence/source import`);
       if (root === 'web' && /(?:src\/|server|database|product\/store|llm\/|agents\/runtime)/.test(specifier)) {
         errors.push(`${file}: server dependency in browser`);
       }

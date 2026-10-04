@@ -37,13 +37,12 @@
   `src/{config,main,platform,security/sanitize}.ts` and
   `src/{agents,api,audit,llm,product}`; the only configuration example is
   `config/agents.example.json`.
-- Real integration harness under `tests/integration` (disposable PostgreSQL +
-  Redis, actual platform API/workers, loopback provider, valueless Anvil) and
+- Real integration harness under `tests/integration` (external disposable
+  PokerTools 2.0.0 deployment, real PostgreSQL/Redis, loopback provider, valueless Anvil) and
   `tests/browser` (Playwright against the real public path), with strict
   no-PENDING final acceptance and provider-key/secret environment boundaries.
-- `@pokertools/{types,sdk}` remain local `file:` dependencies built in the
-  PokerTools checkout and linked with `npm ci`; registry publication is a
-  release follow-up. `npm audit` reports 0 known vulnerabilities; TypeScript
+- `@pokertools/sdk` and `@pokertools/types` consume the published npm packages
+  at exactly `2.0.0`. PokerTools is deployed separately. TypeScript
   stays pinned to 6.0.3 because current typescript-eslint rejects `>=6.1.0`.
 - Documentation is the four durable guides (`docs/ARCHITECTURE.md`,
   `docs/OPERATIONS.md`, `docs/LLM_CONTEXT.md`, `docs/TESTING.md`); obsolete

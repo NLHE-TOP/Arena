@@ -33,11 +33,14 @@ after actually executing them.
 
 ## Real integration and acceptance
 
-`tests/integration` provisions a disposable real topology — PostgreSQL, Redis,
-the actual platform API and workers, the actual built NLHE process and a
-loopback OpenAI-compatible provider — and drives real SIWE wallets through the
+`tests/integration` targets an externally started disposable PokerTools 2.0.0
+deployment backed by real PostgreSQL and Redis. It starts the actual built NLHE
+process and a loopback OpenAI-compatible provider, and drives real SIWE wallets through the
 product's own room orchestration. `tests/browser` drives the real public UI with
-Playwright and an injected EIP-1193 wallet. Nothing is mocked.
+Playwright and an injected EIP-1193 wallet. Platform behavior is never mocked.
+Set `NLHE_IT_PLATFORM_URL`, `NLHE_IT_DATABASE_URL` and `NLHE_IT_REDIS_URL`;
+optionally set `NLHE_IT_POSTGRES_CONTAINER` for operator SQL bootstrap.
+See [the integration guide](../tests/integration/README.md) for financial fixtures.
 
 ```bash
 npx tsx tests/integration/run.ts doctor       # prerequisites/capability report
@@ -71,11 +74,8 @@ from final acceptance. Verified by final acceptance:
 `tests/integration/infra/env-boundary.ts` is a pure builder asserted by the
 `env-boundary` command and `doctor`:
 
-- platform children (build, prisma generate, migrate, seed, API, workers and any
-  Anvil/custody process) receive only the system allowlist plus explicitly
-  declared platform variables; provider names and values (`OPENAI*`,
-  `OPENROUTER*`, other provider segments, `*_API_KEY`, `*_BASE_URL`) are
-  rejected;
+- the external platform is started separately without NLHE provider credentials;
+  the platform-purpose environment builder rejects provider names and values;
 - the NLHE child receives product variables only; platform JWT/cookie/signing/
   custody/RPC secrets are rejected by name and by value;
 - command lines written to logs redact known secret values, and process
@@ -136,5 +136,4 @@ docker build -t nlhe-product:0.3.0 .
 ```
 
 The image runs only the product server and embeds no platform service or secret.
-The local `pokertools/` checkout is excluded from its build context and remains
-available separately for real integration tests.
+PokerTools is deployed separately and is not part of the NLHE source distribution.

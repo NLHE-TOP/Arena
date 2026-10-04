@@ -39,7 +39,7 @@ import { ROSTER_MATRIX, assertMatrixValid, parseRosterNotation, ROSTER_NOTATION 
 import { assertTableOnlyAgentCredential, runAnvilChallenge, runNonfinancialCompetition } from './financial.js';
 import { startActionProxy } from '../infra/action-proxy.js';
 import { startFakeProvider } from '../infra/fake-provider.js';
-import { getAccount } from '../../../pokertools/packages/e2e/tests/finance/helpers/anvil-two-chain.js';
+import { getAccount } from '../infra/wallet.js';
 import { runBrowserChecks } from '../../browser/run.js';
 
 export interface AcceptanceOptions {

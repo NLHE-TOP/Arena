@@ -9,8 +9,8 @@
  *   tsx tests/integration/run.ts doctor       prerequisite/capability report
  *   tsx tests/integration/run.ts list         roster matrix + interfaces
  *
- * The smoke provisions disposable PostgreSQL + Redis, starts the ACTUAL built
- * PokerTools API and workers, then uses only the public `@pokertools/sdk` and
+ * The smoke targets an external PokerTools 2.0.0 test deployment with real
+ * PostgreSQL + Redis, then uses only the public `@pokertools/sdk` and
  * `@pokertools/types` contract with real viem SIWE wallets. It never calls a
  * paid provider. Acceptance suites that need product routes still under
  * implementation are reported PENDING rather than guessed.
@@ -39,7 +39,7 @@ import { ProductClient } from './acceptance/product-client.js';
 import { runProductRoom } from './acceptance/product-room.js';
 import { ROSTER_MATRIX } from './acceptance/roster.js';
 import { runAnvilChallenge, runNonfinancialCompetition } from './acceptance/financial.js';
-import { getAccount } from '../../pokertools/packages/e2e/tests/finance/helpers/anvil-two-chain.js';
+import { getAccount } from './infra/wallet.js';
 import { inspectPersistedDecision } from './inspector.js';
 import type { SeatObservation } from '@pokertools/types';
 
@@ -756,8 +756,8 @@ function runList(): void {
       '  start/settle/cancel/issueAgentCredential; chip grants use',
       '  the canonical POST /chips/grant contract.',
       '',
-      'Builds are strict: a red ./pokertools or product build fails; no last-green',
-      'dist is ever executed.',
+      'PokerTools 2.0.0 is externally deployed; NLHE builds are strict:',
+      'a red product build fails and no last-green dist is ever executed.',
     ].join('\n')
   );
 }

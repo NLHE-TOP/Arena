@@ -1,9 +1,9 @@
 # NLHE real-integration infrastructure (`tests/integration/`, `tests/browser/`)
 
 Reusable, isolated, real-infrastructure acceptance for the NLHE product on top
-of the local PokerTools platform. Nothing here mocks poker, auth, persistence or
-transport: it provisions disposable PostgreSQL + Redis, builds and runs the
-actual platform API/workers and the actual built NLHE process, signs real SIWE
+of an externally started PokerTools 2.0.0 test deployment. Nothing here mocks
+poker, auth, persistence or transport: the platform uses real PostgreSQL + Redis;
+NLHE runs its actual built product process, signs real SIWE
 messages with ephemeral viem wallets, and drives agent seats through a loopback
 OpenAI-compatible provider or the opt-in live provider.
 
@@ -13,11 +13,11 @@ never edited by the harness.
 ## Topology
 
 ```
-disposable PostgreSQL (docker, random loopback port)
-disposable Redis      (docker; local redis-server fallback)
+external disposable PostgreSQL
+external disposable Redis
         │
-        ├─ platform API     node pokertools/packages/api/dist/server.js
-        ├─ platform workers node pokertools/packages/api/dist/workers.js
+        ├─ PokerTools 2.0.0 API     (operator-started)
+        ├─ PokerTools 2.0.0 workers (operator-started)
         │
         ├─ loopback OpenAI-compatible provider (exact request validation,
         │  varied legal `choose_action` tool call, stall/error/invalid modes)
@@ -49,22 +49,18 @@ health surface is exactly `/health` (liveness) and `/ready` (readiness).
 
 ## Strict builds — no stale or partial dist
 
-The local `./pokertools` source tree is the only authoritative platform runtime.
-`ensurePlatformBuilds` builds every stale workspace and **throws on failure**;
-there is no last-green fallback. `NLHE_IT_BUILD=never` refuses missing or stale
-artifacts instead of using them. The NLHE product build is equally strict
-(`ensureNlheBuild`), so a red product build fails the run rather than executing
-an old `dist`.
+NLHE consumes published `@pokertools/sdk@2.0.0` and `@pokertools/types@2.0.0`.
+The platform is deployed separately; NLHE never builds or migrates it.
+`NLHE_IT_BUILD=never` refuses missing or stale NLHE artifacts.
+`ensureNlheBuild` fails on a red product build rather than executing an old `dist`.
 
 ## Secret boundary
 
 `tests/integration/infra/env-boundary.ts` is a pure, exported builder asserted
 by `env-boundary` and `doctor`:
 
-- PokerTools children (build, prisma generate, migrate, seed, API, workers, and
-  any future Anvil/custody process) receive only `PATH HOME TMPDIR TEMP
-  SYSTEMROOT TZ` plus explicitly declared platform variables. Provider names and
-  provider values are rejected (`OPENAI*`, provider hosts/models, API keys).
+- Start the external platform without NLHE provider credentials. The
+  platform-purpose environment builder rejects provider names and values.
 - The NLHE child receives the same system allowlist plus explicitly declared
   product variables (its own provider key, minted orchestration token, agent env
   refs). Platform JWT/cookie/signing/custody/RPC secrets are rejected by name and
@@ -75,14 +71,14 @@ by `env-boundary` and `doctor`:
 `verifyEnvironmentBoundary()` runs against a synthetic secret-bearing
 environment and the real one.
 
-## Prisma generation lock
+## External deployment prerequisites
 
-The platform workspace has one shared generated Prisma client. The harness
-serializes `generate -> migrate -> seed -> API/workers start` under
-`pokertools/.runtime/nlhe-it-prisma.lock` (stale after 10 minutes) so an
-independent PokerTools tester cannot flip the provider mid-boot. Set
-`NLHE_IT_SKIP_PRISMA_GENERATE=1` to assert an existing PostgreSQL generation
-instead of regenerating.
+Set `NLHE_IT_PLATFORM_URL`, `NLHE_IT_DATABASE_URL` and `NLHE_IT_REDIS_URL`.
+The operator starts PokerTools 2.0.0 API/workers and owns migration, seed and
+shutdown. Use a disposable PostgreSQL database: the harness promotes its
+ephemeral operator wallet through SQL. Set `NLHE_IT_POSTGRES_CONTAINER` to run
+that SQL via Docker, or install `psql` for the database URL.
+Configure SIWE chain 31337 and a fast test hand cadence on the external platform.
 
 ## Interfaces (public only)
 
@@ -161,38 +157,44 @@ all of the following are true:
   deposit through the normal public API (`PokerClient.claimDeposit`) — no direct
   payer credit;
 - after the sponsor's real on-chain transfer and public claim, a **declared,
-  unavoidable sponsor budget fixture** (tests-only child importing local
-  PokerTools production source) performs one idempotent, balanced
+   unavoidable platform-owned sponsor budget fixture** performs one idempotent, balanced
   `USER_AVAILABLE -> OPERATOR` classification of exactly the claimed prize
   amount, because the platform prize reserve debits the sponsor's OPERATOR
   account while a public deposit credits USER_AVAILABLE. It creates no value,
   touches no payer balance and no entry/prize/settlement row; the actual custody
   reconciler must still match the on-chain backing after classification;
 - the actual custody worker heartbeat and the actual reconciliation producer run
-  (reusing the PokerTools e2e finance helpers/config); no seeded READY
-  attestation;
+   on the external deployment; no seeded READY attestation;
 - entry/prize/settlement behaviour runs only through the public SDK and the
   actual API; no application-database entry/settlement mutation is allowed.
 
 Test-seam quorum injection and fabricated readiness are not accepted.
 
+For financial scenarios, set `NLHE_IT_FINANCE_FIXTURE` to an absolute path to
+the external deployment's built operator fixture module (`.js`/`.mjs`). It must
+export `startFinancialTopology(input)` satisfying `FinancialTopology` in
+`infra/anvil-finance.ts`: real Anvil transfers/public deposit claims, balanced
+sponsor classification, ledger reads, real custody start and readiness polling.
+The operator fixture must configure the external deployment's sponsor
+allowlist/identity and asset registry for the supplied sponsor before paid
+admission (including any operator-owned service restart that this needs).
+Standard public Anvil accounts are used (never fund them with value).
+NLHE contains no custody or ledger implementation. Missing fixtures fail the
+financial run; they are never replaced with mocks or a skipped acceptance.
+
 ## Environment knobs
 
 | Variable | Meaning |
 | --- | --- |
-| `NLHE_IT_KEEP=1` | leave disposable containers running for inspection |
-| `NLHE_IT_BUILD=auto\|force\|never` | build policy (never refuses missing/stale) |
-| `NLHE_IT_SKIP_PRISMA_GENERATE=1` | assert existing PostgreSQL generation |
-| `NLHE_IT_PG_IMAGE`, `NLHE_IT_REDIS_IMAGE` | override container images |
-| `NLHE_IT_PLATFORM_URL`, `NLHE_IT_DATABASE_URL`, `NLHE_IT_REDIS_URL`, `NLHE_IT_POSTGRES_CONTAINER` | reuse an external topology |
+| `NLHE_IT_BUILD=auto\|force\|never` | NLHE build policy (never refuses missing/stale) |
+| `NLHE_IT_PLATFORM_URL`, `NLHE_IT_DATABASE_URL`, `NLHE_IT_REDIS_URL`, `NLHE_IT_POSTGRES_CONTAINER` | external test topology (container name optional) |
+| `NLHE_IT_FINANCE_FIXTURE` | built operator fixture for the external real financial deployment |
 | `NLHE_IT_ANVIL=1` | attempt the real valueless Anvil challenge |
 | `NLHE_IT_PRODUCT_ROUTES` | JSON `{catalog:[],rooms:[]}` probe override |
 | `NLHE_IT_HEADED=1` | headed Chromium for the browser acceptance |
-| `NLHE_IT_AUTO_DEAL_DELAY_MS` | platform hand cadence (default 250ms) |
 
 ## Notes
 
 - Run artifacts live under `tests/artifacts/integration/<runId>/` (git-ignored).
-- The first `postgres:18-alpine` pull can take a minute; images are cached.
-- A red platform/product source tree fails the run by design; finish the
-  in-flight implementation before running acceptance.
+- The harness never shuts down the operator's external platform services.
+- A red NLHE build or unavailable external deployment fails the run.
