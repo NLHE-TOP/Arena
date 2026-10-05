@@ -83,7 +83,7 @@ Historical baseline: PokerTools work started from published `v2.0.0`, commit
 Published 2.0.0 packages/artifacts remain immutable historical evidence. Current
 NLHE dependencies are published `@pokertools/sdk@2.0.3` and
 `@pokertools/types@2.0.3`; current release acceptance targets the independently
-pinned released 2.0.3 platform artifact. A client version is not runtime
+pinned released 2.0.4 platform artifact. A client version is not runtime
 provenance; no local platform source dependency is allowed.
 
 Published-source hook check: 2.0.0 uses the rate-limit plugin's default

@@ -40,7 +40,7 @@ import {
 } from './supervisor.js';
 
 /**
- * Pinned immutable PokerTools 2.0.3 production image. The default is the ONE
+ * Pinned immutable PokerTools 2.0.4 production image. The default is the ONE
  * central released artifact (`RELEASED_PLATFORM_IMAGE`); a paid wrapper rejects
  * every other reference. The environment override exists only for gated
  * development/readiness runs, never for paid acceptance.

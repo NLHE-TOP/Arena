@@ -33,7 +33,7 @@ after actually executing them.
 
 ## Real integration and acceptance
 
-`tests/integration` targets an externally started disposable released PokerTools 2.0.3
+`tests/integration` targets an externally started disposable released PokerTools 2.0.4
 deployment backed by real PostgreSQL and Redis. It starts the actual built NLHE
 process and a loopback OpenAI-compatible provider, and drives real SIWE wallets through the
 product's own room orchestration. `tests/browser` drives the real public UI with
@@ -110,7 +110,7 @@ following hold:
 ### Focused external-release staging gate
 
 The disposable container gate is separate from the full roster matrix. It uses
-an external operator fixture pinned to released PokerTools 2.0.3; no platform source is
+an external operator fixture pinned to released PokerTools 2.0.4; no platform source is
 embedded in NLHE. The fixture must expose independently supervised Anvil, two
 quorum processes, workers and custody, using their existing operational evidence
 rather than API-style HTTP checks for workers/custody.
@@ -133,7 +133,25 @@ Full mode cannot skip the browser or final secret scan. It requires same-room
 human/agent canonical actions, session/socket recovery, terminal state, two
 active-room restarts, readiness outage/recovery without a product restart,
 zero platform HTTP 429 counters, independent child supervision and cleanup.
-Only a complete successful run emits `DETERMINISTIC_STAGING=PASS`. Its summary
+Generic browser acceptance requires canonical human and agent actions, not a
+particular legal action family. HUMAN FOLD is mandatory only in the dedicated
+deterministic terminal-fold regression; its completion invariants remain strict.
+That regression requires an accepted FOLD with a winner, `HAND_COMPLETED`, a
+completed archive, conserved chips, director progress and a terminal room.
+The focused release checks use the same external fixture and immutable runtime
+pin, without repeating the full historical matrix:
+
+```bash
+NLHE_IT_STAGING_FIXTURE=/absolute/path/to/staging-platform.mjs \
+NLHE_IT_SECRET_SCANNER=/absolute/path/to/secret-scanner.mjs \
+npx tsx tests/integration/container-browser-gate.ts
+
+NLHE_IT_STAGING_FIXTURE=/absolute/path/to/staging-platform.mjs \
+NLHE_IT_SECRET_SCANNER=/absolute/path/to/secret-scanner.mjs \
+npx tsx tests/integration/container-terminal-fold.ts
+```
+
+Only a complete successful full-mode run emits `DETERMINISTIC_STAGING=PASS`. Its summary
 must retain actual platform version, configured image, image ID and registry
 digest (when available), plus the product image and image ID. Paid wrappers
 must compare actual platform artifact identity, not just a gate run ID or PASS

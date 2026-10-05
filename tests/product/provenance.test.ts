@@ -3,7 +3,7 @@
  * guarded paid wrappers.
  *
  * Pure only: no Docker, topology, provider or database is touched. The release
- * digest below is the PROVEN published 2.0.3 ghcr artifact; image IDs are
+ * digest below is the PROVEN published 2.0.4 ghcr artifact; image IDs are
  * synthetic because the actual `.Image` is captured by inspection at runtime
  * (on Docker Desktop/containerd it can equal the digest, so it is never
  * assumed here).
@@ -34,7 +34,7 @@ import {
 import { DEFAULT_PLATFORM_IMAGE } from '../integration/infra/staging.js';
 import { validateDeterministicGateSummary } from '../integration/container-live-sponsored.js';
 
-const RELEASE_DIGEST = 'sha256:a7342a355c3bd35b7cec7acf6b6c50c320227b30b85598a08dae3a1fda00cfe9';
+const RELEASE_DIGEST = 'sha256:115beb096708048f98eb6271c65e6bb4f833c1dc03618cdc8bf3ce2a8f8b5469';
 const RELEASE_IMAGE = `ghcr.io/aaurelions/pokertools@${RELEASE_DIGEST}`;
 const PLATFORM_IMAGE_ID = `sha256:${'1'.repeat(64)}`;
 const PRODUCT_IMAGE = 'nlhe-product:container-gate';
@@ -132,10 +132,10 @@ function terminalFoldProof(overrides: Record<string, unknown> = {}): Record<stri
 }
 
 describe('immutable released platform version and artifact', () => {
-  it('pins the proven 2.0.3 release as the acceptance default', () => {
-    expect(DEFAULT_RELEASE_PLATFORM_VERSION).toBe('2.0.3');
+  it('pins the proven 2.0.4 release as the acceptance default', () => {
+    expect(DEFAULT_RELEASE_PLATFORM_VERSION).toBe('2.0.4');
     expect(RELEASED_PLATFORM_IMAGE).toBe(
-      'ghcr.io/aaurelions/pokertools@sha256:a7342a355c3bd35b7cec7acf6b6c50c320227b30b85598a08dae3a1fda00cfe9'
+      'ghcr.io/aaurelions/pokertools@sha256:115beb096708048f98eb6271c65e6bb4f833c1dc03618cdc8bf3ce2a8f8b5469'
     );
     expect(parseImageDigest(RELEASED_PLATFORM_IMAGE)).toBe(RELEASE_DIGEST);
   });
@@ -148,7 +148,7 @@ describe('immutable released platform version and artifact', () => {
 describe('preflight expected immutable platform artifact', () => {
   it('resolves the central released image when no override is given', () => {
     expect(expectedPlatformArtifact()).toEqual({
-      version: '2.0.3',
+      version: '2.0.4',
       image: RELEASED_PLATFORM_IMAGE,
       digest: RELEASE_DIGEST,
     });
@@ -158,7 +158,7 @@ describe('preflight expected immutable platform artifact', () => {
   it('rejects every other reference, mutable or stale immutable, before topology', () => {
     for (const ref of [
       PRODUCT_IMAGE,
-      'ghcr.io/aaurelions/pokertools:2.0.3',
+      'ghcr.io/aaurelions/pokertools:2.0.4',
       'ghcr.io/aaurelions/pokertools@sha256:abc',
       'ghcr.io/aaurelions/pokertools@latest',
       'ghcr.io/aaurelions/pokertools@sha256:' + 'b'.repeat(64),
@@ -175,7 +175,7 @@ describe('preflight expected immutable platform artifact', () => {
 
     expect(() =>
       assertExpectedPlatformArtifact(platformArtifact({ version: '2.0.2' }), expected)
-    ).toThrow(/version gate=2.0.2 expected=2.0.3/);
+    ).toThrow(/version gate=2.0.2 expected=2.0.4/);
     expect(() =>
       assertExpectedPlatformArtifact(
         platformArtifact({ image: 'ghcr.io/aaurelions/pokertools@sha256:' + 'b'.repeat(64) }),
@@ -190,7 +190,7 @@ describe('preflight expected immutable platform artifact', () => {
         platformArtifact({ digest: 'sha256:' + 'c'.repeat(64) }),
         expected
       )
-    ).toThrow(/digest gate="sha256:c{64}" expected=sha256:a734/);
+    ).toThrow(/digest gate="sha256:c{64}" expected=sha256:115beb/);
   });
 });
 
@@ -203,14 +203,14 @@ describe('actual runtime platform/product guard', () => {
   it('blocks a version mismatch', () => {
     expect(() =>
       assertRuntimePlatformMatches(platformArtifact(), platformArtifact({ version: '2.0.2' }))
-    ).toThrow(/actual platform root version 2.0.2 != gate platformVersion 2.0.3/);
+    ).toThrow(/actual platform root version 2.0.2 != gate platformVersion 2.0.4/);
   });
 
   it('blocks an image mismatch', () => {
     expect(() =>
       assertRuntimePlatformMatches(
         platformArtifact(),
-        platformArtifact({ image: 'ghcr.io/aaurelions/pokertools:2.0.3' })
+        platformArtifact({ image: 'ghcr.io/aaurelions/pokertools:2.0.4' })
       )
     ).toThrow(/actual platform Config.Image .* != gate platformImage/);
   });
@@ -253,7 +253,7 @@ describe('deterministic gate summary provenance', () => {
   it('accepts a full PASS summary and returns the immutable artifact + bound FOLD proof', () => {
     const artifact = validateDeterministicGateSummary(gateSummary(), 0);
     expect(artifact.platform).toEqual({
-      version: '2.0.3',
+      version: '2.0.4',
       image: RELEASE_IMAGE,
       imageId: PLATFORM_IMAGE_ID,
       digest: RELEASE_DIGEST,
@@ -360,7 +360,7 @@ describe('focused terminal FOLD paid eligibility', () => {
     const cases: Array<[Record<string, unknown>, RegExp]> = [
       [{ platform: { version: '2.0.2' } }, /terminal FOLD platform root version 2.0.2 != gate platformVersion/],
       [
-        { platform: { image: 'ghcr.io/aaurelions/pokertools:2.0.3' } },
+        { platform: { image: 'ghcr.io/aaurelions/pokertools:2.0.4' } },
         /terminal FOLD platform Config.Image .* != gate platformImage/,
       ],
       [

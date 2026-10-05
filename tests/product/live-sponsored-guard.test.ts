@@ -14,7 +14,7 @@ import {
 } from '../integration/container-live-sponsored.js';
 import { LIVE_CAPS, LIVE_PER_CALL_COST_USD_MICRO, LIVE_PRICING, assertLiveRoomOutcome } from '../integration/live.js';
 
-const RELEASE_DIGEST = 'sha256:a7342a355c3bd35b7cec7acf6b6c50c320227b30b85598a08dae3a1fda00cfe9';
+const RELEASE_DIGEST = 'sha256:115beb096708048f98eb6271c65e6bb4f833c1dc03618cdc8bf3ce2a8f8b5469';
 const RELEASE_IMAGE = `ghcr.io/aaurelions/pokertools@${RELEASE_DIGEST}`;
 const PLATFORM_IMAGE_ID = `sha256:${'1'.repeat(64)}`;
 const PRODUCT_IMAGE_ID = `sha256:${'2'.repeat(64)}`;
@@ -27,7 +27,7 @@ function validSummary(): Record<string, unknown> {
     checks: [{ name: 'fresh topology readiness', status: 'PASS' }],
     secretScan: 'pass',
     gate: { roomId: 'gate-room', tableId: 'gate-table', restartModes: ['graceful', 'kill'] },
-    platformVersion: '2.0.3',
+    platformVersion: '2.0.4',
     platformImage: RELEASE_IMAGE,
     platformImageId: PLATFORM_IMAGE_ID,
     platformDigest: RELEASE_DIGEST,
@@ -48,7 +48,7 @@ function validSummary(): Record<string, unknown> {
       secretScan: 'pass',
       provenance: {
         platform: {
-          version: '2.0.3',
+          version: '2.0.4',
           image: RELEASE_IMAGE,
           imageId: PLATFORM_IMAGE_ID,
           digest: RELEASE_DIGEST,
@@ -89,7 +89,7 @@ describe('deterministic gate summary guard', () => {
     expect(() => validateDeterministicGateSummary(validSummary(), 0)).not.toThrow();
     const artifact = validateDeterministicGateSummary(validSummary(), 0);
     expect(artifact.platform).toEqual({
-      version: '2.0.3',
+      version: '2.0.4',
       image: RELEASE_IMAGE,
       imageId: PLATFORM_IMAGE_ID,
       digest: RELEASE_DIGEST,

@@ -23,16 +23,17 @@ import { runCommand } from './proc.js';
  * Immutable default of the released PokerTools platform root package version
  * (`/app/package.json`). Paid acceptance refuses any other accepted version.
  */
-export const DEFAULT_RELEASE_PLATFORM_VERSION = '2.0.3';
+export const DEFAULT_RELEASE_PLATFORM_VERSION = '2.0.4';
 
 /**
  * The ONE released immutable platform artifact acceptance is bound to (full
- * digest-pinned ghcr URI, proven by the approved 2.0.3 pull + full-smoke
- * evidence). Staging derives its default from this constant and paid
+ * digest-pinned ghcr URI, resolved from the published 2.0.4 registry index and
+ * verified by an immutable pull/runtime inspection). Staging derives its
+ * default from this constant and paid
  * acceptance rejects every other reference, including stale immutable digests.
  */
 export const RELEASED_PLATFORM_IMAGE =
-  'ghcr.io/aaurelions/pokertools@sha256:a7342a355c3bd35b7cec7acf6b6c50c320227b30b85598a08dae3a1fda00cfe9';
+  'ghcr.io/aaurelions/pokertools@sha256:115beb096708048f98eb6271c65e6bb4f833c1dc03618cdc8bf3ce2a8f8b5469';
 
 /** Monorepo root package manifest inside the pinned PokerTools image. */
 export const PLATFORM_ROOT_PACKAGE_PATH = '/app/package.json';

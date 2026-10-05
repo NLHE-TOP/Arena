@@ -89,7 +89,7 @@ Requires Node.js ^24.15.0 or >=26 and npm >=12.2.0.
 `@pokertools/sdk` and `@pokertools/types` are installed from npm at exactly
 `2.0.3`. PokerTools is deployed separately; installation and container builds
 use only the published packages. Real integration tests target an externally
-started released PokerTools 2.0.3 test deployment. The npm client version does
+started released PokerTools 2.0.4 test deployment. The npm client version does
 not attest to the platform runtime version; container gates record and compare
 the actual immutable platform artifact independently.
 

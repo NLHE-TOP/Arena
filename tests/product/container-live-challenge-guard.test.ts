@@ -31,7 +31,7 @@ import {
   LIVE_PRICING,
 } from '../integration/live.js';
 
-const RELEASE_DIGEST = 'sha256:a7342a355c3bd35b7cec7acf6b6c50c320227b30b85598a08dae3a1fda00cfe9';
+const RELEASE_DIGEST = 'sha256:115beb096708048f98eb6271c65e6bb4f833c1dc03618cdc8bf3ce2a8f8b5469';
 const RELEASE_IMAGE = `ghcr.io/aaurelions/pokertools@${RELEASE_DIGEST}`;
 const PLATFORM_IMAGE_ID = `sha256:${'1'.repeat(64)}`;
 const PRODUCT_IMAGE_ID = `sha256:${'2'.repeat(64)}`;
@@ -58,7 +58,7 @@ function validSponsoredResult(): Record<string, unknown> {
     teardownErrors: [],
     paidCallsConsumed: true,
     infraRetryEligible: false,
-    platformVersion: '2.0.3',
+    platformVersion: '2.0.4',
     platformImage: RELEASE_IMAGE,
     platformImageId: PLATFORM_IMAGE_ID,
     platformDigest: RELEASE_DIGEST,
@@ -174,7 +174,7 @@ describe('completed SPONSORED result guard', () => {
       committed: 2,
       costMicroUsd: 321,
       platform: {
-        version: '2.0.3',
+        version: '2.0.4',
         image: RELEASE_IMAGE,
         imageId: PLATFORM_IMAGE_ID,
         digest: RELEASE_DIGEST,
@@ -210,7 +210,7 @@ describe('completed SPONSORED result guard', () => {
   it('blocks a SPONSORED artifact produced on a different artifact than the reviewed gate', () => {
     const evidence = validateLiveSponsoredResult(validSponsoredResult());
     const gate: PlatformArtifact = {
-      version: '2.0.3',
+      version: '2.0.4',
       image: RELEASE_IMAGE,
       imageId: PLATFORM_IMAGE_ID,
       digest: RELEASE_DIGEST,
@@ -224,7 +224,7 @@ describe('completed SPONSORED result guard', () => {
     ).not.toThrow();
     for (const override of [
       { version: '2.0.2' },
-      { image: 'ghcr.io/aaurelions/pokertools:2.0.3' },
+      { image: 'ghcr.io/aaurelions/pokertools:2.0.4' },
       { imageId: `sha256:${'9'.repeat(64)}` },
       { digest: `sha256:${'9'.repeat(64)}` },
       { digest: null },

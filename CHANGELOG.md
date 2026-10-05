@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — 0.3.0
+## 0.3.0 — 2026-10-05
 
 **User-visible**
 

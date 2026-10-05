@@ -9,6 +9,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+  PlayerStatus,
   SeatObservationSchema,
   type CanonicalActionReceipt,
   type CanonicalActionResult,
@@ -20,10 +21,12 @@ import {
   type CapturedCanonicalRequest,
 } from '../integration/acceptance/canonical-capture.js';
 import {
+  BULLMQ_JOB_STATE_SCRIPT,
   classifyTerminalFold,
   validateTerminalFoldCandidate,
   type TerminalFoldInputs,
 } from '../integration/container-terminal-fold.js';
+import { DEFAULT_RELEASE_PLATFORM_VERSION } from '../integration/infra/provenance.js';
 import type { TerminalDiagnosticsBundle } from '../integration/acceptance/terminal-diagnostics.js';
 import {
   observationInput,
@@ -39,22 +42,57 @@ const REQUEST: CapturedCanonicalRequest = {
   actionId: 'act-fold',
 };
 
-function foldObservation(winners = true): SeatObservation {
+function foldObservation(
+  winners = true,
+  stateOverrides: Partial<SeatObservation['state']> = {}
+): SeatObservation {
   const base = observationInput();
+  // Exact settled fold state: the human folded in the sole-contender shape, no
+  // money remains in pots/currentBets, and the two stacks still sum to the
+  // initial 2 x 1000 chips (the transferred pot stays inside the table).
+  const settledPlayers = base.state.players.map((player, index) =>
+    player === null
+      ? null
+      : index === 0
+        ? {
+            ...player,
+            status: 'FOLDED',
+            stack: 999,
+            betThisStreet: 1,
+            totalInvestedThisHand: 1,
+            isSittingOut: true,
+          }
+        : {
+            ...player,
+            status: 'ACTIVE',
+            stack: 1001,
+            betThisStreet: 1,
+            totalInvestedThisHand: 1,
+            isSittingOut: false,
+          }
+  );
   return SeatObservationSchema.parse({
     ...base,
     version: base.version + 1,
     state: {
       ...base.state,
-      version: base.version + 1,
+      street: 'SHOWDOWN',
       actionTo: null,
-      winners: winners ? [{ seat: 1, amount: 3, hand: null, handRank: null }] : null,
+      pots: [],
+      currentBets: {},
+      winners: winners ? [{ seat: 1, amount: 2, hand: null, handRank: null }] : null,
+      players: settledPlayers,
+      ...stateOverrides,
+      version: base.version + 1,
     },
   });
 }
 
-function capture(winners = true): CanonicalActionCapture {
-  const observation = foldObservation(winners);
+function capture(
+  winners = true,
+  stateOverrides: Partial<SeatObservation['state']> = {}
+): CanonicalActionCapture {
+  const observation = foldObservation(winners, stateOverrides);
   const receipt: CanonicalActionReceipt = {
     requestId: REQUEST.requestId,
     tableId: TEST_TABLE_ID,
@@ -72,6 +110,11 @@ function capture(winners = true): CanonicalActionCapture {
     result,
     acceptedAt: 1_700_000_000_002,
   });
+}
+
+/** Mutable copy of the settled fold state's players for chip invariant tests. */
+function settledPlayers(): SeatObservation['state']['players'] {
+  return foldObservation().state.players.map((player) => (player === null ? null : { ...player }));
 }
 
 function bundle(overrides: Record<string, unknown> = {}): TerminalDiagnosticsBundle {
@@ -142,6 +185,46 @@ function bundle(overrides: Record<string, unknown> = {}): TerminalDiagnosticsBun
       resultVersion: 5,
       eventSeq: 11,
       errorCode: null,
+      // Durable exact observation snapshot used when the HTTP capture never
+      // resolved: same settled sole-contender state (stacks sum to initial).
+      observation: {
+        tableId: TEST_TABLE_ID,
+        handId: TEST_HAND_ID,
+        turnId: REQUEST.turnId,
+        version: 6,
+        eventSeq: 12,
+        state: {
+          handId: TEST_HAND_ID,
+          handNumber: 1,
+          street: 'SHOWDOWN',
+          actionTo: null,
+          winners: [{ seat: 1, amount: 2, handRank: null }],
+          players: [
+            {
+              id: 'entrant-1',
+              seat: 0,
+              status: 'FOLDED',
+              stack: 999,
+              betThisStreet: 1,
+              totalInvestedThisHand: 1,
+              isSittingOut: true,
+            },
+            {
+              id: 'entrant-2',
+              seat: 1,
+              status: 'ACTIVE',
+              stack: 1001,
+              betThisStreet: 1,
+              totalInvestedThisHand: 1,
+              isSittingOut: false,
+            },
+          ],
+          currentBets: {},
+          pots: [],
+          present: true,
+          missing: [],
+        },
+      },
     },
     outbox: [
       {
@@ -287,21 +370,43 @@ function check(verdict: ReturnType<typeof classifyTerminalFold>, name: string): 
   return found.pass;
 }
 
+describe('bullmq job-state read script', () => {
+  it('dispatches membership by Redis type instead of a list-only LPOS', () => {
+    // Regression: an unconditional LPOS against the present `completed` zset
+    // raised WRONGTYPE, so every executed job read `unavailable` and failed the
+    // mandatory diagnostics completeness with `job-state-unreadable`.
+    expect(BULLMQ_JOB_STATE_SCRIPT).toMatch(/redis\.call\('TYPE',key\)\['ok'\]/);
+    expect(BULLMQ_JOB_STATE_SCRIPT).toMatch(
+      /if t=='list' then[\s\S]*?LPOS[\s\S]*?elseif t=='zset' then[\s\S]*?ZSCORE[\s\S]*?elseif t=='set' then[\s\S]*?SISMEMBER/
+    );
+    expect(BULLMQ_JOB_STATE_SCRIPT).not.toMatch(/LPOS', p\.\.k/);
+  });
+
+  it('reports an absent job as captured missing evidence, never as a state', () => {
+    expect(BULLMQ_JOB_STATE_SCRIPT).toMatch(/EXISTS', p\.\.id\)==0 then return \{'missing'/);
+    expect(BULLMQ_JOB_STATE_SCRIPT).toMatch(/local st='unknown'/);
+  });
+});
+
 describe('terminal fold candidate validator', () => {
   const imageId = `sha256:${'a'.repeat(64)}`;
+  // A clearly synthetic, never-published version: the local candidate pointer
+  // must never equal the currently released default (2.0.4), and must stay
+  // below any next real release.
+  const SYNTHETIC_CANDIDATE_VERSION = '9.9.9';
 
-  it('accepts the exact local candidate identity for an unreleased version', () => {
-    expect(validateTerminalFoldCandidate({ version: '2.0.4', imageId })).toEqual({
-      version: '2.0.4',
+  it('accepts the exact local candidate identity for a synthetic unreleased version', () => {
+    expect(validateTerminalFoldCandidate({ version: SYNTHETIC_CANDIDATE_VERSION, imageId })).toEqual({
+      version: SYNTHETIC_CANDIDATE_VERSION,
       imageId,
     });
   });
 
-  it('rejects the released official version and malformed versions', () => {
-    expect(() => validateTerminalFoldCandidate({ version: '2.0.3', imageId })).toThrow(
-      /released official/
-    );
-    for (const version of ['latest', '2.0', 'v2.0.4', '2.0.4-rc1', '', 4]) {
+  it('rejects the currently released official version and malformed versions', () => {
+    expect(() =>
+      validateTerminalFoldCandidate({ version: DEFAULT_RELEASE_PLATFORM_VERSION, imageId })
+    ).toThrow(/released official/);
+    for (const version of ['latest', '9.9', 'v9.9.9', '9.9.9-rc1', '', 4]) {
       expect(() => validateTerminalFoldCandidate({ version, imageId })).toThrow(/exact x\.y\.z/);
     }
   });
@@ -316,15 +421,15 @@ describe('terminal fold candidate validator', () => {
       42,
       null,
     ]) {
-      expect(() => validateTerminalFoldCandidate({ version: '2.0.4', imageId: bad })).toThrow(
-        /exact local Docker image ID/
-      );
+      expect(() =>
+        validateTerminalFoldCandidate({ version: SYNTHETIC_CANDIDATE_VERSION, imageId: bad })
+      ).toThrow(/exact local Docker image ID/);
     }
     expect(() =>
-      validateTerminalFoldCandidate({ version: '2.0.4', imageId, extra: true })
+      validateTerminalFoldCandidate({ version: SYNTHETIC_CANDIDATE_VERSION, imageId, extra: true })
     ).toThrow(/unsupported field/);
     expect(() => validateTerminalFoldCandidate(null)).toThrow(/must be an object/);
-    expect(() => validateTerminalFoldCandidate({ version: '2.0.4' })).toThrow(
+    expect(() => validateTerminalFoldCandidate({ version: SYNTHETIC_CANDIDATE_VERSION })).toThrow(
       /exact local Docker image ID/
     );
   });
@@ -351,6 +456,7 @@ describe('terminal fold classifier', () => {
       secretScan: 'pass',
     });
     expect(verdict.checks.every((entry) => entry.pass)).toBe(true);
+    expect(check(verdict, 'no-stranded-chips')).toBe(true);
     expect(verdict.winnersNonEmpty).toBe(true);
   });
 
@@ -491,6 +597,74 @@ describe('terminal fold classifier', () => {
     const verdict = classifyTerminalFold(inputs({ capture: capture(false) }));
     expect(verdict.evidence.status).toBe('FAIL');
     expect(check(verdict, 'winners-nonempty')).toBe(false);
+  });
+
+  it('FAILs when the completed fold state still holds pot money', () => {
+    // Stacks still sum to the initial chips, but a nonzero pot is stranded
+    // money that was never paid back into the table.
+    const verdict = classifyTerminalFold(
+      inputs({
+        capture: capture(true, {
+          pots: [{ amount: 3, eligibleSeats: [0, 1], type: 'MAIN', capPerPlayer: 0 }],
+        }),
+      })
+    );
+    expect(verdict.evidence.status).toBe('FAIL');
+    expect(check(verdict, 'no-stranded-chips')).toBe(false);
+  });
+
+  it('FAILs when the completed stacks lost chips against the initial stacks', () => {
+    const players = settledPlayers();
+    if (players[0] !== null) players[0] = { ...players[0], stack: 998 };
+    if (players[1] !== null) players[1] = { ...players[1], stack: 1000 };
+    const verdict = classifyTerminalFold(inputs({ capture: capture(true, { players }) }));
+    expect(verdict.evidence.status).toBe('FAIL');
+    expect(check(verdict, 'no-stranded-chips')).toBe(false);
+  });
+
+  it('FAILs when the completed fold state still holds street bets', () => {
+    const verdict = classifyTerminalFold(
+      inputs({ capture: capture(true, { currentBets: { '0': 1, '1': 0 } }) })
+    );
+    expect(verdict.evidence.status).toBe('FAIL');
+    expect(check(verdict, 'no-stranded-chips')).toBe(false);
+  });
+
+  it('FAILs a completed fold state that still has two live contenders', () => {
+    const players = settledPlayers().map((player) =>
+      player === null ? null : { ...player, status: PlayerStatus.ACTIVE }
+    );
+    const verdict = classifyTerminalFold(inputs({ capture: capture(true, { players }) }));
+    expect(verdict.evidence.status).toBe('FAIL');
+    expect(check(verdict, 'no-stranded-chips')).toBe(false);
+  });
+
+  it('accounts for the fold hand settle-hand rake and FAILs when it is unaccounted', () => {
+    const full = bundle();
+    const withRake = bundle({
+      outbox: [
+        ...full.outbox,
+        {
+          ...full.outbox[0]!,
+          id: 'outbox-settle',
+          kind: 'settle-hand',
+          dedupeKey: 'dedupe-settle',
+          payload: { handId: TEST_HAND_ID, rakeTotal: '1' },
+        },
+      ],
+    });
+    // 999 + 1000 covers the initial 2000 chips minus the 1-chip rake exactly.
+    const players = settledPlayers();
+    if (players[0] !== null) players[0] = { ...players[0], stack: 999 };
+    if (players[1] !== null) players[1] = { ...players[1], stack: 1000 };
+    const accounted = classifyTerminalFold(
+      inputs({ diagnostics: withRake, capture: capture(true, { players }) })
+    );
+    expect(check(accounted, 'no-stranded-chips')).toBe(true);
+    // The same completed stacks without the rake obligation must fail closed.
+    const unaccounted = classifyTerminalFold(inputs({ capture: capture(true, { players }) }));
+    expect(check(unaccounted, 'no-stranded-chips')).toBe(false);
+    expect(unaccounted.evidence.status).toBe('FAIL');
   });
 
   it('FAILs a stalled fold hand with no completion, archive or progression', () => {

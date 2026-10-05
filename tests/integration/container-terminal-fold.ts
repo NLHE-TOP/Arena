@@ -111,6 +111,40 @@ const CANDIDATE_IMAGE_ID_RE = /^sha256:[0-9a-f]{64}$/;
 const CANDIDATE_VERSION_RE = /^\d+\.\d+\.\d+$/;
 
 /**
+ * Read-only BullMQ job-state projection over the platform Redis container:
+ * targeted hash fields only (`attemptsMade`/`failedReason`/`processedOn`/
+ * `finishedOn`) plus the list/zset/set-derived state. No job payload/options
+ * are ever read. The value is whitelisted again by the diagnostics module.
+ *
+ * State membership is Redis-TYPE dispatched: BullMQ `wait`/`active`/`paused`
+ * are lists (LPOS), `completed`/`failed`/`delayed`/`prioritized` are sorted
+ * sets (ZSCORE), and `waiting-children` is a set (SISMEMBER). Calling a
+ * list-only command against a present zset raises WRONGTYPE, which previously
+ * made every executed job read `unavailable` and failed the mandatory
+ * completeness contract with `job-state-unreadable`.
+ */
+export const BULLMQ_JOB_STATE_SCRIPT = [
+  "local id=ARGV[1] local p=ARGV[2]",
+  "if redis.call('EXISTS', p..id)==0 then return {'missing','','','',''} end",
+  "local st='unknown'",
+  "for _,k in ipairs({'wait','active','delayed','completed','failed','paused','prioritized','waiting-children'}) do",
+  '  local key=p..k',
+  "  local t=redis.call('TYPE',key)['ok']",
+  '  local found=false',
+  "  if t=='list' then",
+  "    if redis.call('LPOS',key,id) then found=true end",
+  "  elseif t=='zset' then",
+  "    if redis.call('ZSCORE',key,id) then found=true end",
+  "  elseif t=='set' then",
+  '    if redis.call(\'SISMEMBER\',key,id)==1 then found=true end',
+  '  end',
+  '  if found then st=k break end',
+  'end',
+  "local h=redis.call('HMGET', p..id, 'attemptsMade','failedReason','processedOn','finishedOn')",
+  "return {st, h[1] or '', h[2] or '', h[3] or '', h[4] or ''}",
+].join('\n');
+
+/**
  * Pre-publication candidate platform artifact. This is a PROGRAMMATIC-only
  * option (no CLI flag): the caller must supply the exact local Docker image ID
  * of the built candidate, never a mutable tag or a guessed registry digest.
@@ -287,6 +321,108 @@ export function classifyTerminalFold(input: TerminalFoldInputs): TerminalFoldVer
     capture !== null
       ? (capture.observation.state.winners?.length ?? 0) > 0
       : durable?.winnersNonEmpty === true;
+  // ---- no-stranded-chips (exact settled fold observation) ----
+  // The accepted HTTP capture is the primary exact observation; when it never
+  // resolved, the durable receipt's projected snapshot is the boundary. Both
+  // must show a FULLY SETTLED state: no chip remains in pots or currentBets,
+  // every committed chip is conserved across the remaining stacks (minus the
+  // rake the fold hand's settle-hand obligation accounts for), and exactly one
+  // contender is still live (the sole-contender shape the terminal fold must
+  // resolve). Nonzero pots/currentBets or a lost stack is stranded money and
+  // fails closed.
+  const exactState = (capture?.observation.state ??
+    input.diagnostics?.foldReceipt?.observation?.state ??
+    null) as {
+    actionTo?: unknown;
+    winners?: unknown;
+    players?: unknown;
+    pots?: unknown;
+    currentBets?: unknown;
+  } | null;
+  const chipsConservation: { pass: boolean; detail: string | null } = (() => {
+    const fail = (detail: string): { pass: boolean; detail: string } => ({ pass: false, detail });
+    if (exactState === null) return fail('no exact fold observation state for the folded hand');
+    if (exactState.actionTo !== null) {
+      return fail(`the completed fold observation still has a pending actor (${String(exactState.actionTo)})`);
+    }
+    if (!Array.isArray(exactState.winners) || exactState.winners.length === 0) {
+      return fail('the exact fold observation is not a settled winner state');
+    }
+    if (!Array.isArray(exactState.pots)) return fail('the settled state carries no readable pot list');
+    if (!Array.isArray(exactState.players)) return fail('the settled state carries no readable player list');
+    const players = (exactState.players as Array<{ status?: unknown; stack?: unknown } | null>).filter(
+      (player): player is { status?: unknown; stack?: unknown } =>
+        typeof player === 'object' && player !== null
+    );
+    if (players.length < 2) return fail(`the settled state carries ${players.length} seated player(s)`);
+    const stacks: number[] = [];
+    for (const player of players) {
+      if (typeof player.stack !== 'number' || !Number.isFinite(player.stack) || player.stack < 0) {
+        return fail(`a settled stack is not a readable non-negative chip count (${String(player.stack)})`);
+      }
+      if (typeof player.status !== 'string' || player.status.length === 0) {
+        return fail('a settled player status is missing');
+      }
+      stacks.push(player.stack);
+    }
+    let potMoney = 0;
+    for (const pot of exactState.pots) {
+      const amount =
+        typeof pot === 'object' && pot !== null ? (pot as { amount?: unknown }).amount : undefined;
+      if (typeof amount !== 'number' || !Number.isFinite(amount) || amount < 0) {
+        return fail('a settled pot amount is missing or unreadable');
+      }
+      potMoney += amount;
+    }
+    if (potMoney !== 0) {
+      return fail(`the completed fold state still carries ${potMoney} chip(s) in pots`);
+    }
+    const currentBets = exactState.currentBets;
+    if (typeof currentBets !== 'object' || currentBets === null || Array.isArray(currentBets)) {
+      return fail('the settled state carries no readable currentBets projection');
+    }
+    for (const [seat, value] of Object.entries(currentBets as Record<string, unknown>)) {
+      if (typeof value !== 'number' || !Number.isFinite(value) || value !== 0) {
+        return fail(`the completed fold state still carries chip(s) in currentBets (seat ${seat})`);
+      }
+    }
+    const liveContenders = players.filter((player) => player.status !== 'FOLDED').length;
+    if (liveContenders !== 1) {
+      return fail(`the completed fold state has ${liveContenders} live contender(s), not exactly one`);
+    }
+    const startingStack =
+      input.diagnostics?.competition?.startingStack ??
+      input.diagnostics?.tournament?.startingStack ??
+      null;
+    if (startingStack === null || !Number.isFinite(startingStack) || startingStack <= 0) {
+      return fail('no initial chip stack evidence (competition/tournament startingStack missing)');
+    }
+    const initialChips = startingStack * players.length;
+    // Rake is accounted only when the fold hand's own settle-hand obligation
+    // projects a readable rakeTotal; otherwise the completed stacks must cover
+    // every initial chip exactly.
+    let rake = 0;
+    if (handId !== null) {
+      const settleRow = input.diagnostics?.outbox.find(
+        (row) => row.kind === 'settle-hand' && payloadHandMatches(payloadHandId(row.payload), handId)
+      );
+      const rawRake = settleRow?.payload['rakeTotal'];
+      if (rawRake !== undefined && rawRake !== null) {
+        if (typeof rawRake === 'number' && Number.isSafeInteger(rawRake) && rawRake >= 0) {
+          rake = rawRake;
+        } else if (typeof rawRake === 'string' && /^\d+$/.test(rawRake)) {
+          rake = Number(rawRake);
+        } else {
+          return fail('the fold hand settle-hand obligation carries an unreadable rakeTotal');
+        }
+      }
+    }
+    const stackSum = stacks.reduce((total, stack) => total + stack, 0);
+    if (stackSum !== initialChips - rake) {
+      return fail(`completed stacks ${stackSum} + rake ${rake} != initial chips ${initialChips}`);
+    }
+    return { pass: true, detail: null };
+  })();
   // Direct next-hand evidence comes from the platform's own committed
   // HAND_STARTED events strictly after the fold hand's last event; the public
   // replay scan is an independent fallback only.
@@ -418,6 +554,7 @@ export function classifyTerminalFold(input: TerminalFoldInputs): TerminalFoldVer
   const checks: TerminalFoldCheck[] = [
     { name: 'accepted-fold', pass: acceptedFold, detail: acceptedFold ? null : 'no coherent accepted canonical FOLD capture' },
     { name: 'winners-nonempty', pass: winnersNonEmpty, detail: winnersNonEmpty ? null : 'the exact fold result observation carries no winner' },
+    { name: 'no-stranded-chips', pass: chipsConservation.pass, detail: chipsConservation.detail },
     { name: 'diagnostics-complete', pass: diagnosticsComplete, detail: diagnosticsComplete ? null : diagnosticsDetail() },
     { name: 'mandatory-phase6-sections', pass: mandatorySections, detail: mandatorySections ? null : 'table/events/outbox/hand-history/competition/tournament/entrants/reconciliation missing' },
     { name: 'canonical-ready', pass: canonicalReadyPass, detail: canonicalReadyPass ? null : 'canonicalReady is not true' },
@@ -675,22 +812,6 @@ export async function runTerminalFold(
   const redact = (value: string): string =>
     (state.topology?.secretRegistry.redact(value) ?? value).replace(/[\r\n]+/g, ' ').slice(0, 2_000);
 
-  /**
-   * Read-only BullMQ job-state projection over the platform Redis container:
-   * targeted hash fields only (`attemptsMade`/`failedReason`/`processedOn`/
-   * `finishedOn`) plus the list-derived state. No job payload/options are ever
-   * read. The value is whitelisted again by the diagnostics module.
-   */
-  const jobStateScript = [
-    "local id=ARGV[1] local p=ARGV[2]",
-    "if redis.call('EXISTS', p..id)==0 then return {'missing','','','',''} end",
-    "local st='unknown'",
-    "for _,k in ipairs({'wait','active','delayed','completed','failed','paused','prioritized','waiting-children'}) do",
-    "  if redis.call('LPOS', p..k, id) then st=k break end",
-    'end',
-    "local h=redis.call('HMGET', p..id, 'attemptsMade','failedReason','processedOn','finishedOn')",
-    "return {st, h[1] or '', h[2] or '', h[3] or '', h[4] or ''}",
-  ].join('\n');
   const readJobState = async (job: TerminalDiagnosticsJobStateInput): Promise<unknown> => {
     if (state.topology === null) return { state: 'unavailable', exists: null };
     const result = await runCommand(
@@ -701,7 +822,7 @@ export async function runTerminalFold(
         'redis-cli',
         '--json',
         'EVAL',
-        jobStateScript,
+        BULLMQ_JOB_STATE_SCRIPT,
         '0',
         job.outboxId,
         `bull:${job.kind}:`,
@@ -1183,7 +1304,15 @@ export async function runTerminalFold(
       productBaseUrl: runtime.baseUrl,
       platformBaseUrl: topology.platformUrl,
       getRoomEvidence: (roomId) => readRoomEvidence(databasePath!, roomId),
-      humanFoldAfter: { when, onAccepted },
+      humanFoldAfter: {
+        when,
+        onAccepted,
+        // Hold the driver from the moment the scripted provider stalls until
+        // `when()` resolves on the real timeout/new hand: the human's turn must
+        // stay pending for the armed FOLD instead of racing the timeout with
+        // another all-in that could complete the room without a fold.
+        stalled: () => trigger.stallArmed && trigger.resolvedAt === null,
+      },
       onPhase: (phase) => {
         if (typeof phase.roomId === 'string') state.roomId = phase.roomId;
         if (typeof phase.tableId === 'string') state.tableId = phase.tableId;

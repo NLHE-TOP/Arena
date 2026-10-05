@@ -35,6 +35,7 @@ import {
   openRoomFromList,
   pickUiAction,
   roomRow,
+  selectTerminalFoldAction,
   tableVersion,
   uiActionReady,
   waitForTableConnected,
@@ -74,6 +75,16 @@ export interface BrowserHumanFoldOption {
    * check.
    */
   onAccepted?: (capture: CanonicalActionCapture) => void | Promise<void>;
+  /**
+   * True while the deterministic timeout sequence has been triggered but the
+   * post-timeout fold boundary has not resolved yet (provider stalled; the
+   * real timeout worker has not yet resolved the turn). While true the driver
+   * intentionally submits NO action: acting here races the human turn ahead of
+   * the real timeout resolution/new hand and can complete the room before the
+   * required FOLD. Once `when()` arms, the driver submits only the
+   * server-issued FOLD. Omitted keeps the aggressive completion policy.
+   */
+  stalled?: () => boolean;
 }
 
 export interface BrowserHumanActionExchange {
@@ -853,7 +864,20 @@ export async function runBrowserChecks(options: BrowserChecksOptions): Promise<B
                 ? foldTriggerError
                 : new Error(String(foldTriggerError));
             }
-            if (foldOption !== null && foldTriggerArmed && humanFold === null) {
+            const terminalAction = selectTerminalFoldAction({
+              foldConfigured: foldOption !== null,
+              foldArmed: foldTriggerArmed,
+              foldCaptured: humanFold !== null,
+              stalled: foldOption?.stalled?.() === true,
+            });
+            if (terminalAction === 'hold') {
+              // Deterministic hold: the scripted timeout sequence has been
+              // triggered and has not resolved yet. Submitting any action now
+              // would race the human turn ahead of the real timeout
+              // resolution/new hand and can complete the room before the
+              // required FOLD. Wait (the loop deadline above still bounds this)
+              // until `when()` arms the first server-issued FOLD.
+            } else if (terminalAction === 'fold') {
               const accepted = await submitFoldAndCapture();
               if (accepted !== null) {
                 if (accepted.family !== 'FOLD' || accepted.receipt.tableId !== tableId) {
@@ -867,11 +891,12 @@ export async function runBrowserChecks(options: BrowserChecksOptions): Promise<B
                   humanActions: successfulHumanActions.length,
                   detail: `requestId=${accepted.receipt.requestId} handId=${accepted.observation.state.handId} eventSeq=${accepted.receipt.eventSeq}`,
                 });
-              } else {
-                // No server-issued FOLD on this turn: keep the normal
-                // aggressive policy and try again on the next human turn.
-                await uiAction(page, 'maximum', uiCadence);
               }
+              // No fallback to the aggressive policy once the fold is armed:
+              // only the server-issued FOLD may continue play from here, so a
+              // turn that does not offer one stays pending for the next fold
+              // turn. A room that completes without the armed FOLD still fails
+              // the terminal check below; the requirement is never weakened.
             } else {
               await uiAction(page, 'maximum', uiCadence);
             }

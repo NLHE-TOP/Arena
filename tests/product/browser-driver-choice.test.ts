@@ -13,6 +13,7 @@ import {
   classifyTerminalContinuation,
   parseTableVersion,
   pickUiAction,
+  selectTerminalFoldAction,
   tableVersionReady,
   UI_ACTION_CADENCE_MS,
   UI_BETTING_LABEL_SOURCE,
@@ -223,6 +224,73 @@ describe('browser action submission cadence (acceptance only)', () => {
     expect(actionCadenceElapsed(10_000, 10_080, 80)).toBe(true);
     expect(actionCadenceElapsed(0, 79, 80)).toBe(false);
     expect(actionCadenceElapsed(0, 80, 80)).toBe(true);
+  });
+});
+
+describe('deterministic fold terminal-loop policy', () => {
+  it('keeps the aggressive completion policy when no fold mode is configured', () => {
+    expect(
+      selectTerminalFoldAction({
+        foldConfigured: false,
+        foldArmed: false,
+        foldCaptured: false,
+        stalled: false,
+      })
+    ).toBe('aggressive');
+  });
+
+  it('plays aggressively until the scripted stall actually starts', () => {
+    expect(
+      selectTerminalFoldAction({
+        foldConfigured: true,
+        foldArmed: false,
+        foldCaptured: false,
+        stalled: false,
+      })
+    ).toBe('aggressive');
+  });
+
+  it('holds every human turn while the timeout sequence is pending (never races it)', () => {
+    // The regression: continuing the aggressive policy after the provider
+    // stalls can complete the room before the post-timeout fold boundary, so
+    // the driver must submit nothing until the trigger arms.
+    expect(
+      selectTerminalFoldAction({
+        foldConfigured: true,
+        foldArmed: false,
+        foldCaptured: false,
+        stalled: true,
+      })
+    ).toBe('hold');
+  });
+
+  it('submits only the armed FOLD until it is captured, then completes', () => {
+    expect(
+      selectTerminalFoldAction({
+        foldConfigured: true,
+        foldArmed: true,
+        foldCaptured: false,
+        stalled: false,
+      })
+    ).toBe('fold');
+    // Remaining stalled=true after arming (resolvedAt not yet observed) must
+    // still prioritize the fold, never the aggressive policy.
+    expect(
+      selectTerminalFoldAction({
+        foldConfigured: true,
+        foldArmed: true,
+        foldCaptured: false,
+        stalled: true,
+      })
+    ).toBe('fold');
+    expect(
+      selectTerminalFoldAction({
+        foldConfigured: true,
+        foldArmed: true,
+        foldCaptured: true,
+        stalled: false,
+      })
+    ).toBe('aggressive');
   });
 });
 

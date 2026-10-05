@@ -398,3 +398,33 @@ export async function waitForUiFoldReadiness(page: Page, timeoutMs = 60_000): Pr
     { timeout: timeoutMs }
   );
 }
+
+// ---------------------------------------------------------------------------
+// Deterministic human-fold terminal policy
+// ---------------------------------------------------------------------------
+
+/** One terminal-loop decision: hold, submit the armed FOLD, or play aggressively. */
+export type TerminalFoldAction = 'hold' | 'fold' | 'aggressive';
+
+/**
+ * Pure terminal-loop policy for the deterministic human-fold mode.
+ *
+ * - `hold`: the scripted timeout sequence is pending (provider stalled, real
+ *   timeout/new hand not resolved yet) and the FOLD is not armed. Submitting
+ *   any action here can race the human turn ahead of the fold boundary and
+ *   complete the room without the required FOLD, so the driver waits instead.
+ * - `fold`: the trigger is armed and no accepted FOLD has been captured yet;
+ *   only the server-issued FOLD may continue play.
+ * - `aggressive`: no fold mode is configured, the fold is already captured, or
+ *   the stall has not started; the normal completion policy continues.
+ */
+export function selectTerminalFoldAction(input: {
+  foldConfigured: boolean;
+  foldArmed: boolean;
+  foldCaptured: boolean;
+  stalled: boolean;
+}): TerminalFoldAction {
+  if (!input.foldConfigured || input.foldCaptured) return 'aggressive';
+  if (input.foldArmed) return 'fold';
+  return input.stalled ? 'hold' : 'aggressive';
+}

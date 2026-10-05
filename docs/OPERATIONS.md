@@ -153,12 +153,13 @@ secret. The agent catalog is supplied at runtime (mount it at
 docker build -t nlhe-product:0.3.0 .
 ```
 
-Integration tests target an externally started released PokerTools 2.0.3 test deployment.
+Integration tests target an externally started released PokerTools 2.0.4 test deployment.
 The npm package version and platform runtime identity are separate provenance;
 release acceptance records the actual image, image ID, version and digest.
-The released 2.0.3 platform image is
-`ghcr.io/aaurelions/pokertools@sha256:a7342a355c3bd35b7cec7acf6b6c50c320227b30b85598a08dae3a1fda00cfe9`
-(resolved from the published 2.0.3 Docker pull metadata). API, workers and
+The released 2.0.4 platform image is
+`ghcr.io/aaurelions/pokertools@sha256:115beb096708048f98eb6271c65e6bb4f833c1dc03618cdc8bf3ce2a8f8b5469`
+(resolved from the published 2.0.4 registry index and verified by immutable
+Docker pull/runtime inspection). API, workers and
 custody must use that same reviewed artifact; do not infer this from SDK/types.
 The full-stack compose/runbook lives with the platform.
 

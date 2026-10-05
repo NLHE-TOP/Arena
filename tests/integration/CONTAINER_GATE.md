@@ -36,7 +36,7 @@ Environment:
 | Variable | Meaning |
 | --- | --- |
 | `NLHE_IT_STAGING_FIXTURE` | absolute path to a built fixture exporting `startStagingPlatform` (required) |
-| `NLHE_IT_PLATFORM_IMAGE` | released PokerTools 2.0.3 immutable image (default: `ghcr.io/aaurelions/pokertools@sha256:a7342a355c3bd35b7cec7acf6b6c50c320227b30b85598a08dae3a1fda00cfe9`) |
+| `NLHE_IT_PLATFORM_IMAGE` | released PokerTools 2.0.4 immutable image (default: `ghcr.io/aaurelions/pokertools@sha256:115beb096708048f98eb6271c65e6bb4f833c1dc03618cdc8bf3ce2a8f8b5469`) |
 | `NLHE_IT_PRODUCT_IMAGE` | product image (default `nlhe-product:container-gate`) |
 | `NLHE_IT_SECRET_SCANNER` | absolute path to the external final secret scanner |
 | `NLHE_IT_TERMINAL_FOLD_SUMMARY` | absolute path to the focused terminal-FOLD summary; required for paid eligibility, bound to the gate's actual platform and product artifacts |
