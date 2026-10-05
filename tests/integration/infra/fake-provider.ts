@@ -336,7 +336,7 @@ export async function startFakeProvider(options: FakeProviderOptions = {}): Prom
     },
     stop: async () => {
       for (const resolve of stalled.splice(0)) resolve();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await new Promise<void>((resolve) => (server.close(() => resolve()), server.closeAllConnections()));
     },
   };
 }

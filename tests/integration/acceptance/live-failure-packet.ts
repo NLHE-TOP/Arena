@@ -1,3 +1,5 @@
+import { execFile as finiteDiagnosticExec } from 'node:child_process';
+import { promisify as finiteDiagnosticPromisify } from 'node:util';
 /**
  * Live-failure packet: one sanitized, read-only orchestration capture for a
  * live run that is about to abort.
@@ -722,6 +724,31 @@ export function createBullMqJobStateReader(options: {
         base.exists = false;
         probes.push(base);
         return { state: 'missing', exists: false };
+      }
+      // Real Redis probes use one read-only JSON reply; empty HGET values
+      // cannot truncate or shift the positional interactive redis-cli output.
+      if (!options.executor) {
+        const lua = `local q=ARGV[1]; local id=ARGV[2]; local h=q..':'..id;
+local st='unknown'; local exists=redis.call('EXISTS',h);
+if exists==0 then st='missing' else
+ for _,p in ipairs({{'completed','zset'},{'failed','zset'},{'active','list'},{'delayed','zset'},{'wait','list'},{'paused','list'},{'waiting-children','zset'}}) do
+ local v; if p[2]=='zset' then v=redis.call('ZSCORE',q..':'..p[1],id) else v=redis.call('LPOS',q..':'..p[1],id) end;
+ if v then st=p[1]; if st=='wait' or st=='paused' then st='waiting' end; break end; end; end;
+local function num(k) local v=redis.call('HGET',h,k); return v and tonumber(v) or cjson.null end;
+return cjson.encode({state=st,exists=exists==1,attemptsMade=num('attemptsMade'),processedOn=num('processedOn'),finishedOn=num('finishedOn')})`;
+        try {
+          const { stdout } = await finiteDiagnosticPromisify(finiteDiagnosticExec)('docker',
+            ['exec', options.redisContainer, 'redis-cli', '--raw', 'EVAL', lua, '0', `${prefix}:${input.kind}`, input.outboxId],
+            { timeout: 5_000, maxBuffer: 16_384 });
+          const projected = JSON.parse(stdout) as { state: BullMqJobProbe['state']; exists: boolean; attemptsMade: number | null; processedOn: number | null; finishedOn: number | null };
+          Object.assign(base, projected, { queue: input.kind });
+          probes.push({ ...base });
+          return { state: base.state, exists: base.exists, attemptsMade: base.attemptsMade,
+            processedOn: base.processedOn, finishedOn: base.finishedOn, failedReason: null };
+        } catch {
+          probes.push({ ...base });
+          return { state: 'unavailable', exists: null };
+        }
       }
       const queue = input.kind;
       const hashKey = `${prefix}:${queue}:${input.outboxId}`;
