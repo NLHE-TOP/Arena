@@ -355,6 +355,42 @@ describe('product decision provider over HTTP loopback', () => {
     }
   });
 
+  it('sanitizes the unparsed response before bounding so no secret prefix survives', async () => {
+    const secret = `known-unparsed-${'9'.repeat(24)}`;
+    const recorded: Recorded = { events: [], requests: [], responses: [] };
+    // The secret starts 8 characters before the 4096-character unparsed
+    // diagnostic cap: truncating before redaction would retain its first 8
+    // characters in the persisted response.
+    const body = `${'x'.repeat(4088)}${secret}${'tail'.repeat(16)}`;
+    const fake = await startFakeProvider(() => ({ status: 200, body }));
+    try {
+      const provider = new ProductDecisionProvider(baseConfig(fake.url, recorded, { apiKey: secret }));
+      await expect(provider.chooseAction({ observation })).rejects.toBeInstanceOf(Error);
+      expect(recorded.responses).toHaveLength(1);
+      const responseJson = recorded.responses[0]!.responseJson;
+      expect(responseJson).not.toBeNull();
+      expect(responseJson).toContain('unparsed');
+      // Boolean assertions with generic messages: a failure never prints the
+      // credential or one of its fragments.
+      for (const length of [8, 12, 16]) {
+        expect(
+          responseJson!.includes(secret.slice(0, length)),
+          `persisted unparsed response carries a ${length}-char credential prefix`
+        ).toBe(false);
+        expect(
+          responseJson!.includes(secret.slice(-length)),
+          `persisted unparsed response carries a ${length}-char credential suffix`
+        ).toBe(false);
+      }
+      expect(
+        responseJson!.includes(secret),
+        'persisted unparsed response carries the credential'
+      ).toBe(false);
+    } finally {
+      await fake.close();
+    }
+  });
+
   it('redacts secret chat ids before hashing so transport and inspection never drift', async () => {
     const secret = 'sk-chat-id-secret-123456';
     const recorded: Recorded = { events: [], requests: [], responses: [] };

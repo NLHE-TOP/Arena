@@ -164,7 +164,7 @@ export function summarizeChosenActions(evidence: RoomEvidence): ChosenActionSumm
     try {
       const chosen = parseChosenAction(attempt.response_json);
       const observation = JSON.parse(decision.observation_json) as {
-        legalActions?: Array<{ actionId: string; family: string; minAmount?: number; maxAmount?: number }>;
+        legalActions?: Array<{ actionId: string; family: string; amount?: number; minAmount?: number; maxAmount?: number }>;
       };
       const legal = observation.legalActions?.find((action) => action.actionId === chosen.actionId) ?? null;
       const requiresAmount =

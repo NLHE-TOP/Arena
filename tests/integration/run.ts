@@ -571,6 +571,14 @@ async function runRoomProve(): Promise<Report> {
         fakeProvider: environment.fakeProvider,
         productDatabasePath: databasePath,
         maxWaitMs: 10 * 60 * 1000,
+        // Focused 1H1A gate: zero rate limits under normal pacing, proven by
+        // the platform's own /metrics 429 counter (the SDK retries 429s
+        // internally, so driver-level counters alone cannot prove zero).
+        requireNoRateLimit: true,
+        platformMetrics: {
+          url: environment.platform.baseUrl,
+          token: process.env.NLHE_IT_PLATFORM_METRICS_TOKEN ?? null,
+        },
         onHumanAction: () => { acceptedHumanActions += 1; },
       });
       if (acceptedHumanActions === 0) throw new Error('no accepted human canonical action');

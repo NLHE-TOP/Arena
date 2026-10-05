@@ -146,14 +146,20 @@ service and never embeds the PokerTools API, PostgreSQL, Redis, custody or any
 secret. The agent catalog is supplied at runtime (mount it at
 `AGENTS_CONFIG_PATH`); the image contains no catalog and no secrets.
 
-`@pokertools/{types,sdk}` are installed from npm at exactly `2.0.0` through
+`@pokertools/{types,sdk}` are installed from npm at exactly `2.0.3` through
 `npm ci`. PokerTools is deployed separately; no local SDK/types build is required:
 
 ```bash
 docker build -t nlhe-product:0.3.0 .
 ```
 
-Integration tests target an externally started PokerTools 2.0.0 test deployment.
+Integration tests target an externally started released PokerTools 2.0.3 test deployment.
+The npm package version and platform runtime identity are separate provenance;
+release acceptance records the actual image, image ID, version and digest.
+The released 2.0.3 platform image is
+`ghcr.io/aaurelions/pokertools@sha256:a7342a355c3bd35b7cec7acf6b6c50c320227b30b85598a08dae3a1fda00cfe9`
+(resolved from the published 2.0.3 Docker pull metadata). API, workers and
+custody must use that same reviewed artifact; do not infer this from SDK/types.
 The full-stack compose/runbook lives with the platform.
 
 ## Explicitly not provided

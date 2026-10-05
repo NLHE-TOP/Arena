@@ -22,7 +22,7 @@ export interface RunContext {
   keep: boolean;
   /** Build policy for NLHE artifacts only. */
   build: 'auto' | 'force' | 'never';
-  /** Operator-started disposable PokerTools 2.0.0 test deployment. */
+  /** Operator-started disposable released PokerTools test deployment. */
   external: {
     platformUrl?: string;
     databaseUrl?: string;

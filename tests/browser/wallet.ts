@@ -12,7 +12,7 @@
  * function) so no bundler helper such as `__name` can leak into the page.
  */
 import type { Page } from 'playwright';
-import { verifyMessage } from 'viem';
+import { verifyMessage, type TypedDataDefinition } from 'viem';
 import type { EphemeralWallet } from '../integration/infra/wallet.js';
 
 export interface InjectedWalletHandle {
@@ -123,11 +123,11 @@ export async function installInjectedWallet(
       message?: Record<string, unknown>;
     };
     return wallet.account.signTypedData({
-      domain: (typedData.domain ?? {}) as never,
-      types: (typedData.types ?? {}) as never,
+      domain: typedData.domain ?? {},
+      types: typedData.types ?? {},
       primaryType: typedData.primaryType ?? '',
-      message: (typedData.message ?? {}) as never,
-    });
+      message: typedData.message ?? {},
+    } as TypedDataDefinition<Record<string, unknown>>);
   });
 
   await page.addInitScript({ content: providerSource(wallet.address, chainId) });

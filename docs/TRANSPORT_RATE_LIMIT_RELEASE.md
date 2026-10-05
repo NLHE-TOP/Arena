@@ -78,11 +78,13 @@ platform requests, so a whole-platform rolling-60-second peak is unavailable.
 
 ## External platform provenance
 
-PokerTools work starts from published `v2.0.0`, commit
+Historical baseline: PokerTools work started from published `v2.0.0`, commit
 `dac7df553f8eef5326043e1ffd88ef0dde003067`, in a separate external worktree.
-Published 2.0.0 packages/artifacts must remain immutable. NLHE retains published
-`@pokertools/sdk@2.0.0` and `@pokertools/types@2.0.0` until a verified 2.0.1
-release exists; no local platform source dependency is allowed.
+Published 2.0.0 packages/artifacts remain immutable historical evidence. Current
+NLHE dependencies are published `@pokertools/sdk@2.0.3` and
+`@pokertools/types@2.0.3`; current release acceptance targets the independently
+pinned released 2.0.3 platform artifact. A client version is not runtime
+provenance; no local platform source dependency is allowed.
 
 Published-source hook check: 2.0.0 uses the rate-limit plugin's default
 `onRequest` phase and IP key, with no `trustProxy` option. The plugin appends

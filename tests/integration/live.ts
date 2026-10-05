@@ -42,14 +42,16 @@
  *   actual FAIL with a non-zero exit, not as "unavailable credentials".
  */
 import { randomUUID } from 'node:crypto';
+import { realpathSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { CompetitionClient } from '@pokertools/sdk';
 import { createRunContext, type RunContext } from './infra/context.js';
 import { startEnvironment, type TestEnvironment } from './infra/environment.js';
 import { probeProductSurface, surfaceReady, describeSurface } from './infra/capabilities.js';
 import { ensureNlheBuild, startNlhe, writeFakeAgentRoster, type NlheHandle } from './infra/nlhe.js';
 import { ephemeralWallet, loginWallet, type WalletSession } from './infra/wallet.js';
-import { ensureOperator } from './infra/admin.js';
+import { ensureOperator, type AdminDatabaseTarget } from './infra/admin.js';
 import {
   mintOrchestrationToken,
   productAdminToken,
@@ -58,12 +60,29 @@ import {
 } from './infra/agents.js';
 import { ProductApiError, ProductClient, type ProductRoomView } from './acceptance/product-client.js';
 import { readRoomEvidence, inspectRoomEvidence } from './acceptance/evidence.js';
-import { driveHumanSeats } from './acceptance/product-room.js';
+import {
+  adminDatabaseQuery,
+  assertExactlyOnceFinancialJournalsAcrossRestart,
+} from './acceptance/financial-journals.js';
+import {
+  driveHumanSeats,
+  type HumanActionObserver,
+  type HumanActionRejectionReason,
+  type HumanDriverStats,
+} from './acceptance/product-room.js';
+import { readPlatform429Total, type PlatformMetricsSource } from './acceptance/platform-metrics.js';
+import { rateLimitContextLabel } from './infra/trace-platform.js';
 import type { FinancialTopology } from './infra/anvil-finance.js';
 import { getAccount } from './infra/wallet.js';
 
 /** Fixed, conservative live bounds. Never loosened at runtime. */
-export const LIVE_CAPS = Object.freeze({
+export const LIVE_CAPS: Readonly<{
+  maxCalls: number;
+  maxCostUsdMicro: bigint;
+  perCallTimeoutMs: number;
+  overallRuntimeMs: number;
+  maxHands: number;
+}> = Object.freeze({
   maxCalls: 24,
   maxCostUsdMicro: 50_000n,
   perCallTimeoutMs: 5_000,
@@ -89,6 +108,34 @@ export const LIVE_CHALLENGE_ENTRY_ATOMIC = '1';
 export const LIVE_CHALLENGE_PRIZE_ATOMIC = '2';
 
 /**
+ * Assertion bounds injected into the shared live outcome helper, typed from
+ * the frozen `LIVE_CAPS`. A call site that passes nothing keeps EXACTLY
+ * `LIVE_CAPS` (24 calls / 50 000 micro-USD / 120 000 ms); the deterministic
+ * CHALLENGE entrypoint injects its own acceptance bounds explicitly. The live
+ * constants are never changed or raised by injection.
+ */
+export type ChallengeAssertionCaps = Pick<
+  typeof LIVE_CAPS,
+  'maxCalls' | 'maxCostUsdMicro' | 'overallRuntimeMs'
+>;
+
+/**
+ * Pure injected cap gate for the shared outcome assertion. Keeping the exact
+ * bounds separately testable proves both the LIVE_CAPS default and the
+ * deterministic injection without a topology.
+ */
+export function assertLiveOutcomeCaps(
+  calls: number,
+  costMicroUsd: number,
+  caps: ChallengeAssertionCaps = LIVE_CAPS
+): void {
+  if (calls > caps.maxCalls) throw new Error(`live call cap exceeded: ${calls}`);
+  if (BigInt(costMicroUsd) > caps.maxCostUsdMicro) {
+    throw new Error(`live cost cap exceeded: ${costMicroUsd} micro-USD`);
+  }
+}
+
+/**
  * The product rate-limits its HTTP surface at 120 requests/minute, so room
  * polling is paced at 5s (well under the limit) and any 429 is retried with a
  * bounded backoff instead of hammering the limiter.
@@ -96,25 +143,36 @@ export const LIVE_CHALLENGE_PRIZE_ATOMIC = '2';
 const ROOM_POLL_INTERVAL_MS = 5_000;
 const RATE_LIMIT_BACKOFF_MS = Object.freeze({ initial: 1_000, max: 15_000, maxRetries: 4 });
 
+/** Product 429s observed by the focused live scenario (must gate to zero). */
+const productRateLimits = { responses: 0, retries: 0 };
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** GET /api/rooms/:id with bounded backoff on the product's 429 rate limit. */
 async function getRoomPaced(product: ProductClient, roomId: string): Promise<ProductRoomView> {
-  let delayMs = RATE_LIMIT_BACKOFF_MS.initial;
+  let delayMs: number = RATE_LIMIT_BACKOFF_MS.initial;
   for (let retry = 0; ; retry += 1) {
     try {
       return await product.getRoom(roomId);
     } catch (error) {
-      if (
-        !(error instanceof ProductApiError) ||
-        error.status !== 429 ||
-        retry >= RATE_LIMIT_BACKOFF_MS.maxRetries
-      ) {
-        throw error;
+      if (!(error instanceof ProductApiError) || error.status !== 429) throw error;
+      productRateLimits.responses += 1;
+      const advised = error.retryAfterMs;
+      if (advised !== null && advised > RATE_LIMIT_BACKOFF_MS.max) {
+        // Never retry earlier than the limiter requires; fail explicitly.
+        throw new Error(
+          `product advised a ${advised}ms retry wait above the ${RATE_LIMIT_BACKOFF_MS.max}ms bound for ${roomId}; refusing to retry early (last 429: ${
+            rateLimitContextLabel() ?? 'endpoint unknown'
+          })`,
+          { cause: error }
+        );
       }
-      await sleep(delayMs);
+      if (retry >= RATE_LIMIT_BACKOFF_MS.maxRetries) throw error;
+      const waitMs = advised ?? delayMs;
+      productRateLimits.retries += 1;
+      await sleep(waitMs);
       delayMs = Math.min(delayMs * 2, RATE_LIMIT_BACKOFF_MS.max);
     }
   }
@@ -122,19 +180,26 @@ async function getRoomPaced(product: ProductClient, roomId: string): Promise<Pro
 
 /**
  * Poll one room until `isTarget` accepts it. Every poll is paced at 5s and a
- * FAILED room is surfaced immediately; a timeout names the last observed
- * status so a room that never reaches ACTIVE fails with a clear reason.
+ * FAILED room is surfaced immediately; an optional `abort` fails the wait the
+ * moment an attached driver rejects (never waiting for the room timeout), and
+ * a timeout names the last observed status so a room that never reaches ACTIVE
+ * fails with a clear reason.
  */
 async function waitForRoom(
   product: ProductClient,
   roomId: string,
   label: string,
   timeoutMs: number,
-  isTarget: (room: ProductRoomView) => boolean
+  isTarget: (room: ProductRoomView) => boolean,
+  abort?: { error: () => unknown }
 ): Promise<ProductRoomView> {
   const deadline = Date.now() + timeoutMs;
   let last: ProductRoomView | null = null;
   for (;;) {
+    const failure = abort?.error();
+    if (failure !== null && failure !== undefined) {
+      throw failure instanceof Error ? failure : new Error(String(failure));
+    }
     last = await getRoomPaced(product, roomId);
     if (isTarget(last)) return last;
     if (last.status === 'FAILED') {
@@ -150,6 +215,28 @@ async function waitForRoom(
       last?.failureReason ? ` (${last.failureReason})` : ''
     }`
   );
+}
+
+/**
+ * Focused live gate: no unexpected rate limit anywhere in the run. An
+ * exhausted human backoff is rethrown; a bounded-aside 429 (product or
+ * platform, including ones the SDK retried internally) is reported as the
+ * actual FAIL instead of disappearing behind a later terminal timeout.
+ */
+function assertNoRateLimits(
+  label: string,
+  humanStats: HumanDriverStats,
+  humanError: unknown,
+  platform429Delta: number
+): void {
+  if (humanError !== null) {
+    throw humanError instanceof Error ? humanError : new Error(String(humanError));
+  }
+  if (humanStats.rateLimitResponses > 0 || productRateLimits.responses > 0 || platform429Delta > 0) {
+    throw new Error(
+      `${label}: unexpected rate limit observed (independent platform 429 delta=${platform429Delta}, driver platform 429s=${humanStats.rateLimitResponses} boundedRetries=${humanStats.rateLimitRetries}, product 429s=${productRateLimits.responses} productRetries=${productRateLimits.retries}); normal pacing must gate zero`
+    );
+  }
 }
 
 function loadDotEnv(): void {
@@ -170,7 +257,7 @@ function requireEnv(name: string): string {
 }
 
 /** Reject any attempt to loosen the fixed caps through the environment. */
-function assertFixedCaps(): void {
+export function assertFixedCaps(): void {
   const declared: Array<[string, number]> = [
     ['LIVE_LLM_MAX_CALLS', LIVE_CAPS.maxCalls],
     ['LIVE_LLM_MAX_USD_MICRO', Number(LIVE_CAPS.maxCostUsdMicro)],
@@ -197,16 +284,33 @@ function parseLiveMode(argv: readonly string[]): LiveMode {
   return { challenge: argv.includes('--challenge') };
 }
 
-interface LiveScenarioInput {
+/**
+ * Only the environment surface both live scenarios actually consume. The
+ * in-repo suite passes a full `TestEnvironment`; the guarded standalone
+ * CHALLENGE wrapper builds this from the fresh staging topology (platform
+ * handle + admin DB target + read-only financial adapter) without a full
+ * `TestEnvironment`.
+ */
+export type LiveScenarioEnvironment = Pick<TestEnvironment, 'platform' | 'adminTarget' | 'financial'>;
+
+export interface LiveScenarioInput {
   context: RunContext;
-  environment: TestEnvironment;
-  nlhe: NlheHandle;
+  environment: LiveScenarioEnvironment;
+  /**
+   * The scenarios need exactly the restart capability. The in-repo suite
+   * passes the full `NlheHandle`; the guarded standalone CHALLENGE wrapper
+   * passes `{ restart: () => runtime.restart('graceful') }` so the standalone
+   * container is usable without the process-based handle type.
+   */
+  nlhe: Pick<NlheHandle, 'restart'>;
   product: ProductClient;
   principals: ProvisionedAgent[];
   databasePath: string;
+  /** Independent platform /metrics source for the focused zero-429 gate. */
+  platformMetrics: PlatformMetricsSource;
 }
 
-interface LiveRoomOutcome {
+export interface LiveRoomOutcome {
   calls: number;
   costMicroUsd: number;
   committed: number;
@@ -238,15 +342,18 @@ async function readChallengeBalances(
 }
 
 /**
- * Shared strict outcome assertion for both live modes: room COMPLETE, fixed
- * call/cost caps, inspector clean over every attempt (including failed), and at
- * least one COMMITTED decision backed by a SUCCEEDED provider attempt.
+ * Shared strict outcome assertion for both live modes: room COMPLETE, the
+ * injected call/cost caps (absent injection keeps EXACTLY `LIVE_CAPS`),
+ * inspector clean over every attempt (including failed), and at least one
+ * COMMITTED decision backed by a SUCCEEDED provider attempt.
  */
-async function assertLiveRoomOutcome(input: {
+export async function assertLiveRoomOutcome(input: {
   context: RunContext;
   room: ProductRoomView;
   databasePath: string;
   agentPrincipalIds: ReadonlySet<string>;
+  /** Assertion bounds; absent keeps EXACTLY the frozen LIVE_CAPS. */
+  caps?: ChallengeAssertionCaps;
 }): Promise<LiveRoomOutcome> {
   const evidence = readRoomEvidence(input.databasePath, input.room.id);
   const inspection = await inspectRoomEvidence(evidence, {
@@ -275,8 +382,7 @@ async function assertLiveRoomOutcome(input: {
       `live room ended ${input.room.status}: ${input.room.failureReason ?? 'no reason'}; attempt failures: ${failures.join(' | ') || 'none'}`
     );
   }
-  if (calls > LIVE_CAPS.maxCalls) throw new Error(`live call cap exceeded: ${calls}`);
-  if (BigInt(cost) > LIVE_CAPS.maxCostUsdMicro) throw new Error(`live cost cap exceeded: ${cost} micro-USD`);
+  assertLiveOutcomeCaps(calls, cost, input.caps);
   if (inspection.violations.length > 0) {
     throw new Error(`live evidence violations: ${inspection.violations[0]!.detail}`);
   }
@@ -295,6 +401,7 @@ async function assertLiveRoomOutcome(input: {
 /** Default mixed SPONSORED 1H1A live room (unchanged behavior). */
 async function runSponsoredScenario(input: LiveScenarioInput): Promise<void> {
   const { context, environment, product, principals, databasePath } = input;
+  const platform429Before = await readPlatform429Total(input.platformMetrics);
   const human = await loginWallet(environment.platform.baseUrl, ephemeralWallet());
   const created = await product.createRoom(
     { name: `live-1H1A-${context.runId}`, mode: 'SPONSORED', humanCount: 1, agentIds: [principals[0]!.agentId] },
@@ -316,20 +423,54 @@ async function runSponsoredScenario(input: LiveScenarioInput): Promise<void> {
   context.log(`live room ${created.id} ACTIVE: table=${active.pokerTableId}`);
 
   let terminal = false;
+  let humanStats: HumanDriverStats = { observations: 0, actions: 0, rateLimitResponses: 0, rateLimitRetries: 0 };
+  let humanError: unknown = null;
+  let notifyDriverSettled: () => void = () => {};
+  const driverSettled = new Promise<void>((resolve) => {
+    notifyDriverSettled = resolve;
+  });
   const humanDriver = driveHumanSeats({
     humans: [human],
     tableId: active.pokerTableId,
     isTerminal: () => terminal,
+  })
+    .then((stats) => {
+      humanStats = stats;
+    })
+    .catch((error: unknown) => {
+      // Captured immediately; the terminal wait below aborts on it so the
+      // exact failure is never masked by the room timeout.
+      humanError = error;
+    })
+    .finally(notifyDriverSettled);
+  const driverFailure: Promise<never> = driverSettled.then(async (): Promise<never> => {
+    if (humanError !== null) throw humanError;
+    return await new Promise<never>(() => {});
   });
-  const finished = await waitForRoom(
+  const roomWait = waitForRoom(
     product,
     created.id,
     'terminal',
     LIVE_CAPS.overallRuntimeMs,
-    (room) => room.status === 'COMPLETE' || room.status === 'FAILED'
+    (room) => room.status === 'COMPLETE' || room.status === 'FAILED',
+    { error: () => humanError }
   );
-  terminal = true;
-  await humanDriver.catch(() => undefined);
+  let finished: ProductRoomView;
+  try {
+    finished = await Promise.race([roomWait, driverFailure]);
+  } finally {
+    // Bounded cancellation/drain: stop the driver loop and settle every
+    // branch so no promise is left unhandled.
+    terminal = true;
+    void driverFailure.catch(() => undefined);
+    await humanDriver.catch(() => undefined);
+    void roomWait.catch(() => undefined);
+  }
+  context.log(
+    `live human driver: observations=${humanStats.observations} actions=${humanStats.actions} platform429s=${humanStats.rateLimitResponses} boundedRetries=${humanStats.rateLimitRetries}`
+  );
+  const platform429After = await readPlatform429Total(input.platformMetrics);
+  assertNoRateLimits('live sponsored', humanStats, humanError, platform429After - platform429Before);
 
   const outcome = await assertLiveRoomOutcome({
     context,
@@ -345,7 +486,7 @@ async function runSponsoredScenario(input: LiveScenarioInput): Promise<void> {
 
 interface ChallengeSettlementInput {
   context: RunContext;
-  nlhe: NlheHandle;
+  nlhe: Pick<NlheHandle, 'restart'>;
   product: ProductClient;
   financial: FinancialTopology;
   payer: WalletSession;
@@ -356,6 +497,17 @@ interface ChallengeSettlementInput {
   entryAtomic: bigint;
   prizeAtomic: bigint;
   room: ProductRoomView;
+  /** Operator database target for read-only exactly-once journal evidence. */
+  adminTarget: AdminDatabaseTarget;
+}
+
+/** Safe, serializable settlement + journal result for the live CHALLENGE run. */
+export interface ChallengeSettlementOutcome {
+  winnerKind: 'HUMAN' | 'AGENT';
+  prizeStatus: string;
+  journalFingerprint: string;
+  journalCount: number;
+  entryDebitCount: number;
 }
 
 /**
@@ -365,9 +517,9 @@ interface ChallengeSettlementInput {
  * one charge and one disposition, and an actual product restart must not change
  * any of it.
  */
-async function assertChallengeSettlement(
+export async function assertChallengeSettlement(
   input: ChallengeSettlementInput
-): Promise<{ winnerKind: 'HUMAN' | 'AGENT'; prizeStatus: string }> {
+): Promise<ChallengeSettlementOutcome> {
   const { context, financial, payer, sponsor, competitions, entryAtomic, prizeAtomic, room } = input;
   const winner = (room.results ?? []).find((placement) => placement.finishPosition === 1) ?? null;
   if (winner === null) throw new Error('completed challenge room has no placement-1 winner');
@@ -412,9 +564,45 @@ async function assertChallengeSettlement(
   );
 
   // Restart the actual product process: durable recovery/reconciliation must
-  // not charge the entry or settle the prize a second time.
-  await input.nlhe.restart();
-  await sleep(8_000);
+  // not charge the entry or settle the prize a second time. Exactly-once
+  // journal evidence is captured around this EXISTING restart only: validate
+  // the terminal ledger first, restart once, then require byte-identical
+  // evidence (no extra paid run, no second financial restart).
+  const journalEvidence = await assertExactlyOnceFinancialJournalsAcrossRestart({
+    query: adminDatabaseQuery(input.adminTarget),
+    competitionId: input.competitionId,
+    expectations: {
+      status: 'FINISHED',
+      prizeStatus: expectedPrizeStatus,
+      expectedPayerPrincipalIds: [payer.userId],
+      expectedServicePrincipalIds: [input.agentPrincipalId],
+    },
+    restart: async () => {
+      await input.nlhe.restart();
+      await sleep(8_000);
+    },
+  });
+  context.log(
+    `challenge financial journals: fingerprint=${journalEvidence.fingerprint.slice(0, 16)} journals=${journalEvidence.digest.journalCount} entryDebits=${journalEvidence.digest.entryDebits.length} prize=${journalEvidence.digest.prizeStatus}`
+  );
+  writeFileSync(
+    join(context.artifactDir, 'challenge-financial-journals.json'),
+    `${JSON.stringify(
+      {
+        competitionId: journalEvidence.digest.competitionId,
+        status: journalEvidence.digest.status,
+        prizeStatus: journalEvidence.digest.prizeStatus,
+        winnerKind: winner.kind,
+        entryDebits: journalEvidence.digest.entryDebits,
+        journalCount: journalEvidence.digest.journalCount,
+        requestIds: journalEvidence.digest.requestIds,
+        fingerprint: journalEvidence.fingerprint,
+      },
+      null,
+      2
+    )}\n`,
+    { mode: 0o600 }
+  );
   const afterRestart = await readChallengeBalances(financial, payer, sponsor);
   if (
     afterRestart.payer !== after.payer ||
@@ -439,17 +627,106 @@ async function assertChallengeSettlement(
   if (roomAfterRestart.status !== 'COMPLETE') {
     throw new Error(`challenge room after restart ${roomAfterRestart.status} != COMPLETE`);
   }
-  return { winnerKind: winner.kind, prizeStatus: settled.prizeStatus };
+  return {
+    winnerKind: winner.kind,
+    prizeStatus: settled.prizeStatus,
+    journalFingerprint: journalEvidence.fingerprint,
+    journalCount: journalEvidence.digest.journalCount,
+    entryDebitCount: journalEvidence.digest.entryDebits.length,
+  };
+}
+
+/** Safe progress snapshot emitted by the live CHALLENGE scenario. */
+export interface LiveChallengeProgress {
+  roomId: string;
+  status: string;
+  tableId: string | null;
+  competitionId: string | null;
+  /**
+   * Latest canonical SDK human action identity (metadata only). `pending`
+   * after submission, then `accepted`/`rejected`; a rejected or
+   * network-interrupted request keeps its exact requestId so the failure
+   * packet never falls back to an older agent FOLD.
+   */
+  canonicalHumanAction?: LiveChallengeHumanAction | null;
+}
+
+export interface LiveChallengeHumanAction {
+  tableId: string;
+  handId: string | null;
+  requestId: string;
+  turnId: string;
+  actionId: string;
+  state: 'pending' | 'accepted' | 'rejected';
+  /** Bounded reason when `state === 'rejected'`; never free text. */
+  rejection: HumanActionRejectionReason | null;
+  /** HTTP status when known (metadata only). */
+  status: number | null;
+}
+
+export interface LiveChallengeObserver {
+  /** Called after each durable room transition; never carries credentials. */
+  onProgress?(progress: LiveChallengeProgress): void;
+}
+
+/**
+ * Safe, serializable outcome of one completed live CHALLENGE scenario. It
+ * carries exactly the evidence the guarded standalone wrapper persists:
+ * calls/committed/cost, winner, entry/prize disposition, the unchanged journal
+ * fingerprint and the completed restart.
+ */
+export interface LiveChallengeOutcome {
+  roomId: string;
+  tableId: string | null;
+  competitionId: string;
+  calls: number;
+  costMicroUsd: number;
+  committed: number;
+  winnerKind: 'HUMAN' | 'AGENT';
+  prizeStatus: string;
+  entryAtomic: string;
+  prizeAtomic: string;
+  /** Journal evidence fingerprint captured around the one existing restart. */
+  journalFingerprint: string;
+  journalCount: number;
+  entryDebitCount: number;
+  /** The one existing product restart completed with unchanged evidence. */
+  restart: true;
 }
 
 /**
  * Valueless real-money CHALLENGE 1H1A on the actual financial topology. The
  * room itself is product-orchestrated; the harness only funds/claims real
  * on-chain value, opts the payer in through the public SDK and asserts the
- * exactly-once, winner-aware settlement.
+ * exactly-once, winner-aware settlement. The optional `caps` injection binds
+ * the terminal wait and the shared outcome assertion; absent injection keeps
+ * EXACTLY `LIVE_CAPS`, so every paid call site is unchanged.
  */
-async function runChallengeScenario(input: LiveScenarioInput): Promise<void> {
+export async function runChallengeScenario(
+  input: LiveScenarioInput,
+  observer?: LiveChallengeObserver,
+  /** Terminal-wait/outcome assertion bounds; default EXACTLY LIVE_CAPS. */
+  caps: ChallengeAssertionCaps = LIVE_CAPS
+): Promise<LiveChallengeOutcome> {
   const { context, environment, product, principals, databasePath } = input;
+  let lastRoom: ProductRoomView | null = null;
+  let humanAction: LiveChallengeHumanAction | null = null;
+  const emit = (room: ProductRoomView): void => {
+    lastRoom = room;
+    observer?.onProgress?.({
+      roomId: room.id,
+      status: room.status,
+      tableId: room.pokerTableId,
+      competitionId: room.pokerCompetitionId,
+      canonicalHumanAction: humanAction,
+    });
+  };
+  const notify = (room: ProductRoomView): void => emit(room);
+  const emitHumanAction = (): void => {
+    if (lastRoom === null) return;
+    emit(lastRoom);
+  };
+  const platform429Before = await readPlatform429Total(input.platformMetrics);
   const financial = environment.financial;
   if (financial === null) {
     throw new Error(
@@ -551,6 +828,7 @@ async function runChallengeScenario(input: LiveScenarioInput): Promise<void> {
     { walletToken: payer.token }
   );
   let room = await product.startRoom(created.id, { walletToken: payer.token });
+  notify(room);
   context.log(
     `challenge room ${created.id} started: status=${room.status} competition=${room.pokerCompetitionId ?? 'pending'}`
   );
@@ -567,6 +845,7 @@ async function runChallengeScenario(input: LiveScenarioInput): Promise<void> {
     });
     await payerCompetitions.optIn(room.pokerCompetitionId);
     room = await product.startRoom(created.id, { walletToken: payer.token });
+    notify(room);
     context.log(`challenge room ${created.id} resumed after payer opt-in: status=${room.status}`);
   }
   const active = await waitForRoom(
@@ -579,6 +858,7 @@ async function runChallengeScenario(input: LiveScenarioInput): Promise<void> {
   if (active.pokerTableId === null) throw new Error('challenge room ACTIVE without a table');
   const competitionId = active.pokerCompetitionId;
   if (competitionId === null) throw new Error('challenge room ACTIVE without a competition id');
+  notify(active);
   context.log(
     `challenge room ${created.id} ACTIVE: table=${active.pokerTableId} competition=${competitionId}`
   );
@@ -614,20 +894,75 @@ async function runChallengeScenario(input: LiveScenarioInput): Promise<void> {
   }
 
   let terminal = false;
+  let humanStats: HumanDriverStats = { observations: 0, actions: 0, rateLimitResponses: 0, rateLimitRetries: 0 };
+  let humanError: unknown = null;
+  let notifyDriverSettled: () => void = () => {};
+  const driverSettled = new Promise<void>((resolve) => {
+    notifyDriverSettled = resolve;
+  });
+  const humanActionObserver: HumanActionObserver = {
+    onSubmitted: (submitted) => {
+      humanAction = { ...submitted, state: 'pending', rejection: null, status: null };
+      emitHumanAction();
+    },
+    onAcceptedAction: (capture) => {
+      if (humanAction !== null && humanAction.requestId === capture.receipt.requestId) {
+        humanAction = { ...humanAction, state: 'accepted' };
+        emitHumanAction();
+      }
+    },
+    onRejected: (rejected) => {
+      if (humanAction !== null && humanAction.requestId === rejected.requestId) {
+        humanAction = {
+          ...humanAction,
+          state: 'rejected',
+          rejection: rejected.reason,
+          status: rejected.status,
+        };
+        emitHumanAction();
+      }
+    },
+  };
   const humanDriver = driveHumanSeats({
     humans: [payer],
     tableId: active.pokerTableId,
     isTerminal: () => terminal,
+    humanActionObserver,
+  })
+    .then((stats) => {
+      humanStats = stats;
+    })
+    .catch((error: unknown) => {
+      humanError = error;
+    })
+    .finally(notifyDriverSettled);
+  const driverFailure: Promise<never> = driverSettled.then(async (): Promise<never> => {
+    if (humanError !== null) throw humanError;
+    return await new Promise<never>(() => {});
   });
-  const finished = await waitForRoom(
+  const roomWait = waitForRoom(
     product,
     created.id,
     'terminal',
-    LIVE_CAPS.overallRuntimeMs,
-    (candidate) => candidate.status === 'COMPLETE' || candidate.status === 'FAILED'
+    caps.overallRuntimeMs,
+    (candidate) => candidate.status === 'COMPLETE' || candidate.status === 'FAILED',
+    { error: () => humanError }
   );
-  terminal = true;
-  await humanDriver.catch(() => undefined);
+  let finished: ProductRoomView;
+  try {
+    finished = await Promise.race([roomWait, driverFailure]);
+  } finally {
+    terminal = true;
+    void driverFailure.catch(() => undefined);
+    await humanDriver.catch(() => undefined);
+    void roomWait.catch(() => undefined);
+  }
+  context.log(
+    `live challenge human driver: observations=${humanStats.observations} actions=${humanStats.actions} platform429s=${humanStats.rateLimitResponses} boundedRetries=${humanStats.rateLimitRetries}`
+  );
+  notify(finished);
+  const platform429After = await readPlatform429Total(input.platformMetrics);
+  assertNoRateLimits('live challenge', humanStats, humanError, platform429After - platform429Before);
 
   // The room may have failed on the provider budget/runtime; in that case the
   // shared assertion below reports the room failure and its attempt errors.
@@ -646,6 +981,7 @@ async function runChallengeScenario(input: LiveScenarioInput): Promise<void> {
           entryAtomic,
           prizeAtomic,
           room: finished,
+          adminTarget: environment.adminTarget,
         })
       : null;
   const outcome = await assertLiveRoomOutcome({
@@ -653,11 +989,31 @@ async function runChallengeScenario(input: LiveScenarioInput): Promise<void> {
     room: finished,
     databasePath,
     agentPrincipalIds: new Set(principals.map((principal) => principal.principalId)),
+    caps,
   });
+  if (settlement === null) {
+    throw new Error(`challenge room ${finished.id} ended ${finished.status} without a settlement`);
+  }
   // eslint-disable-next-line no-console
   console.log(
-    `live challenge acceptance completed: calls=${outcome.calls} costMicroUsd=${outcome.costMicroUsd} committed=${outcome.committed} winner=${settlement?.winnerKind ?? 'none'} prizeStatus=${settlement?.prizeStatus ?? 'none'}`
+    `live challenge acceptance completed: calls=${outcome.calls} costMicroUsd=${outcome.costMicroUsd} committed=${outcome.committed} winner=${settlement.winnerKind} prizeStatus=${settlement.prizeStatus} journalFingerprint=${settlement.journalFingerprint.slice(0, 16)}`
   );
+  return {
+    roomId: created.id,
+    tableId: active.pokerTableId,
+    competitionId,
+    calls: outcome.calls,
+    costMicroUsd: outcome.costMicroUsd,
+    committed: outcome.committed,
+    winnerKind: settlement.winnerKind,
+    prizeStatus: settlement.prizeStatus,
+    entryAtomic: entryAtomic.toString(),
+    prizeAtomic: prizeAtomic.toString(),
+    journalFingerprint: settlement.journalFingerprint,
+    journalCount: settlement.journalCount,
+    entryDebitCount: settlement.entryDebitCount,
+    restart: true,
+  };
 }
 
 async function main(): Promise<void> {
@@ -780,6 +1136,10 @@ async function main(): Promise<void> {
       product,
       principals,
       databasePath,
+      platformMetrics: {
+        url: environment.platform.baseUrl,
+        token: process.env.NLHE_IT_PLATFORM_METRICS_TOKEN ?? null,
+      },
     };
     if (mode.challenge) {
       await runChallengeScenario(scenario);
@@ -792,8 +1152,25 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((error) => {
-  // eslint-disable-next-line no-console
-  console.error(error instanceof Error ? error.message : error);
-  process.exitCode = 1;
-});
+/**
+ * Only execute when this file is the process entrypoint. Importing the shared
+ * caps or outcome helper (for example from the guarded standalone live
+ * wrapper) must never start a paid scenario or print PENDING.
+ */
+function invokedAsEntrypoint(): boolean {
+  const entry = process.argv[1];
+  if (entry === undefined) return false;
+  try {
+    return realpathSync(entry) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (invokedAsEntrypoint()) {
+  main().catch((error) => {
+    // eslint-disable-next-line no-console
+    console.error(error instanceof Error ? error.message : error);
+    process.exitCode = 1;
+  });
+}

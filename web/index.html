@@ -25,7 +25,7 @@
       </div>
       <div class="top-actions">
         <span class="chip" id="platformChip">platform: loading…</span>
-        <span class="chip mono" id="walletChip" hidden></span>
+        <span class="chip mono" id="walletChip" data-testid="wallet-chip" hidden></span>
         <button class="btn primary small" id="connectBtn" type="button">Connect wallet</button>
         <button class="btn ghost small" id="disconnectBtn" type="button" hidden>Sign out</button>
       </div>
@@ -42,7 +42,7 @@
           <h2>Rooms</h2>
           <button class="btn ghost small" id="refreshRoomsBtn" type="button">Refresh</button>
         </div>
-        <div class="room-list" id="roomList">
+        <div class="room-list" id="roomList" data-testid="room-list">
           <p class="empty">Loading rooms…</p>
         </div>
 
@@ -102,10 +102,10 @@
         </details>
       </section>
 
-      <section class="panel room-card" id="roomCard" hidden>
+      <section class="panel room-card" id="roomCard" data-testid="room-card" hidden>
         <div class="card-head">
-          <h2 id="roomTitle">Room</h2>
-          <span class="chip" id="roomStatusChip"></span>
+          <h2 id="roomTitle" data-testid="room-title">Room</h2>
+          <span class="chip" id="roomStatusChip" data-testid="room-status"></span>
         </div>
         <dl class="meta" id="roomMeta"></dl>
         <div class="roster" id="roomRoster"></div>
@@ -115,19 +115,19 @@
         </div>
         <p class="form-note" id="entryNote" hidden></p>
         <div class="row-actions">
-          <button class="btn ghost small" id="roomRefreshBtn" type="button">Refresh room</button>
+          <button class="btn ghost small" id="roomRefreshBtn" data-testid="room-refresh" type="button">Refresh room</button>
           <button class="btn primary small" id="joinRoomBtn" type="button">Join room</button>
           <button class="btn primary small" id="startRoomBtn" type="button">Start room</button>
         </div>
         <p class="form-note" id="roomNote" role="status"></p>
       </section>
 
-      <section class="panel table-card" id="tableCard" hidden>
+      <section class="panel table-card" id="tableCard" data-testid="table-card" hidden>
         <div class="card-head">
           <h2>Live table</h2>
           <div class="table-chips">
-            <span class="chip" id="tableConnection">ws: off</span>
-            <span class="chip" id="tableVersion">v—</span>
+            <span class="chip" id="tableConnection" data-testid="table-connection">ws: off</span>
+            <span class="chip" id="tableVersion" data-testid="table-version">v—</span>
             <button class="btn ghost small" id="refreshTableBtn" type="button">Refresh</button>
           </div>
         </div>
@@ -135,7 +135,7 @@
         <dl class="meta" id="tableMeta"></dl>
         <div class="seats" id="seats" aria-label="Seats"></div>
         <div class="action-area">
-          <div class="turn-line" id="turnLine" aria-live="polite"></div>
+          <div class="turn-line" id="turnLine" data-testid="turn-line" aria-live="polite"></div>
           <div class="legal-actions" id="legalActions" role="group" aria-label="Server-issued legal actions"></div>
         </div>
       </section>

@@ -65,35 +65,73 @@ function defined(source: NodeJS.ProcessEnv): Record<string, string> {
   return out;
 }
 
-/** Collect credential-shaped source values without ever exposing them. */
-export function collectSecretValues(source: NodeJS.ProcessEnv = process.env): string[] {
+/**
+ * One or more credential sources. Multiple sources are collected
+ * independently: a child environment that overrides an ambient variable name
+ * must not hide the ambient value from redaction.
+ */
+export type SecretSource = NodeJS.ProcessEnv | readonly NodeJS.ProcessEnv[];
+
+/**
+ * Collect credential-shaped source values without ever exposing them.
+ *
+ * `extraSecrets` carries values generated inside this process (for example a
+ * disposable database password) that can never be discovered from names in the
+ * environment. They are filtered with the same minimum length as env values so
+ * a one-character "secret" can never redact ordinary text.
+ */
+export function collectSecretValues(
+  source: SecretSource = process.env,
+  extraSecrets: readonly string[] = []
+): string[] {
   const values: string[] = [];
-  for (const [name, value] of Object.entries(defined(source))) {
-    if (!SECRET_VALUE_NAME_RE.test(name) || NON_SECRET_VALUE_NAME_RE.test(name)) continue;
-    if (value.length < MIN_SECRET_VALUE_LENGTH) continue;
+  const sources: readonly NodeJS.ProcessEnv[] = Array.isArray(source) ? source : [source];
+  for (const entry of sources) {
+    for (const [name, value] of Object.entries(defined(entry))) {
+      if (!SECRET_VALUE_NAME_RE.test(name) || NON_SECRET_VALUE_NAME_RE.test(name)) continue;
+      if (value.length < MIN_SECRET_VALUE_LENGTH) continue;
+      values.push(value);
+    }
+  }
+  for (const value of extraSecrets) {
+    if (typeof value !== 'string') continue;
+    if (value.length < MIN_SECRET_VALUE_LENGTH || value.includes('\n')) continue;
     values.push(value);
   }
   return [...new Set(values)].sort((left, right) => right.length - left.length);
 }
 
 /**
+ * Redact known credential values from arbitrary diagnostic text (log lines,
+ * captured stdout/stderr tails). The full value is matched against the raw
+ * text; nothing is truncated before redaction, so a secret can never survive
+ * as a prefix or suffix of a bounded diagnostic.
+ */
+export function redactSecretText(
+  text: string,
+  extraSecrets: readonly string[] = [],
+  source: SecretSource = process.env
+): string {
+  let out = text;
+  for (const secret of collectSecretValues(source, extraSecrets)) {
+    if (out.includes(secret)) out = out.split(secret).join('<redacted>');
+  }
+  return out;
+}
+
+/**
  * Redact credential values from a command line before it is logged. Arguments
  * themselves are retained (never process env), with any occurrence of a known
- * secret value replaced.
+ * secret value replaced. `extraSecrets` covers values generated in-process
+ * (argv-only credentials) that are absent from the environment.
  */
 export function redactCommandLine(
   command: string,
   args: readonly string[],
-  source: NodeJS.ProcessEnv = process.env
+  source: SecretSource = process.env,
+  extraSecrets: readonly string[] = []
 ): string {
-  const secrets = collectSecretValues(source);
-  const redact = (value: string): string => {
-    let out = value;
-    for (const secret of secrets) {
-      if (out.includes(secret)) out = out.split(secret).join('<redacted>');
-    }
-    return out;
-  };
+  const redact = (value: string): string => redactSecretText(value, extraSecrets, source);
   return `$ ${redact(command)} ${args.map(redact).join(' ')}`;
 }
 

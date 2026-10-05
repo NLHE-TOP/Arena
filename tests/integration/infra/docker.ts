@@ -81,7 +81,9 @@ export async function startPostgres(runId: string, artifactDir: string): Promise
       '127.0.0.1::5432',
       POSTGRES_IMAGE,
     ],
-    { timeoutMs: 600_000, logFile }
+    // The password is generated here and is not in process.env: declare it so
+    // no command line, log line or error tail can carry it.
+    { timeoutMs: 600_000, logFile, knownSecrets: [password] }
   );
   try {
     await waitForContainerCommand(container, ['pg_isready', '-U', 'postgres', '-d', 'postgres'], (out) =>
@@ -196,8 +198,15 @@ export async function psqlContainer(container: string, sql: string): Promise<str
 
 /** SQL through a host psql client for an externally supplied DATABASE_URL. */
 export async function psqlUrl(databaseUrl: string, sql: string): Promise<string> {
+  // The URL is an acceptance-infrastructure credential, not product metadata.
+  // It may be supplied directly rather than through process.env.
+  const url = new URL(databaseUrl);
+  let password = url.password;
+  try { password = decodeURIComponent(password); } catch { /* Preserve literal percent characters. */ }
+  const knownSecrets = [databaseUrl, url.password, password].filter(Boolean);
   const result = await runCommandOrThrow('psql', [databaseUrl, '-v', 'ON_ERROR_STOP=1', '-tAc', sql], {
     timeoutMs: 30_000,
+    knownSecrets,
   });
   return result.stdout.trim();
 }

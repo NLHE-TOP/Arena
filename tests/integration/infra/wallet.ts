@@ -61,7 +61,9 @@ export async function loginWallet(
     chainId: options.chainId ?? 31337,
     statement: options.statement ?? 'NLHE integration acceptance',
   });
-  const signature = await (wallet.account ?? wallet).signMessage({ message });
+  const signer = wallet.account ?? wallet;
+  if (signer.signMessage === undefined) throw new Error('acceptance wallet has no SIWE signer');
+  const signature = await signer.signMessage({ message });
   const login = await client.login({ message, signature });
   return {
     client,

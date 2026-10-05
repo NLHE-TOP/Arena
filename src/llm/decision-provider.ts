@@ -366,9 +366,11 @@ export class ProductDecisionProvider {
       responseJson = JSON.stringify(
         payload === null
           ? {
-              unparsed: sanitizeSecretText(body.text.slice(0, MAX_UNPARSED_RESPONSE_CHARS), {
+              // Sanitize BEFORE bounding: slicing first could retain a prefix
+              // of a known secret that straddles the diagnostic cap.
+              unparsed: sanitizeSecretText(body.text, {
                 knownSecrets: this.knownSecrets,
-              }),
+              }).slice(0, MAX_UNPARSED_RESPONSE_CHARS),
             }
           : sanitizeSecretValue(payload, { knownSecrets: this.knownSecrets }),
       );

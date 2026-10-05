@@ -4,7 +4,7 @@
 # PostgreSQL, Redis and the custody worker are separate services and are never
 # embedded or started here.
 #
-# @pokertools/{types,sdk} are installed from npm at exactly 2.0.0.
+# @pokertools/{types,sdk} are installed from npm at exactly 2.0.3.
 # Build the standalone product image:
 #   docker build -t nlhe-product:0.3.0 .
 

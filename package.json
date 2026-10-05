@@ -20,8 +20,8 @@
   "dependencies": {
     "@fastify/rate-limit": "11.2.0",
     "@fastify/static": "10.1.5",
-    "@pokertools/sdk": "2.0.0",
-    "@pokertools/types": "2.0.0",
+    "@pokertools/sdk": "2.0.3",
+    "@pokertools/types": "2.0.3",
     "better-sqlite3": "13.0.3",
     "fastify": "5.12.5",
     "zod": "4.6.5"

@@ -112,6 +112,7 @@ import { ensureNlheBuild, startNlhe, writeFakeAgentRoster, type NlheHandle } fro
 import { startFakeProvider, type FakeProviderHandle } from './infra/fake-provider.js';
 import { FIXTURE_API_KEY, FIXTURE_MODEL } from './infra/fixtures.js';
 import { DEFAULT_PLATFORM_IMAGE, startStagingTopology, type StagingTopology } from './infra/staging.js';
+import { RELEASED_PLATFORM_IMAGE } from './infra/provenance.js';
 import type { TestEnvironment } from './infra/environment.js';
 import {
   coverageComparison,
@@ -142,9 +143,8 @@ type RequiredScenarioName = (typeof REQUIRED_SCENARIO_NAMES)[number];
 const WALLET_ONLY_SCENARIO = 'wallet-only' as const;
 type ScenarioName = RequiredScenarioName | typeof WALLET_ONLY_SCENARIO;
 
-/** Exact published PokerTools 2.0.0 image digest (never env-overridable). */
-const PUBLISHED_PLATFORM_2_0_0_IMAGE =
-  'ghcr.io/aaurelions/pokertools@sha256:b0764ca686b65ecb77905df198536d2eb3560264db58176fe8cdc04a6bc77d71';
+/** Central released immutable platform image (never env-overridable here). */
+const PUBLISHED_PLATFORM_2_0_0_IMAGE = RELEASED_PLATFORM_IMAGE;
 
 const HUMAN_POOL_SIZE = 4;
 const AGENT_POOL_SIZE = 10;
@@ -681,8 +681,8 @@ async function runBudget(args: BudgetArgs): Promise<number> {
     context.log(`platform image: ${topology.platformImage}`);
     context.log(
       topology.platformImage === PUBLISHED_PLATFORM_2_0_0_IMAGE
-        ? 'platform image is the published 2.0.0 pinned digest'
-        : 'external platform override: publication/version must be verified separately (not a 2.0.0 claim)'
+        ? 'platform image is the central released pinned digest'
+        : 'external platform override: publication/version must be verified separately (not a released-artifact claim)'
     );
 
     // Authoritative baseline BEFORE operator/provisioning setup, so the setup

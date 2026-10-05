@@ -33,7 +33,7 @@ after actually executing them.
 
 ## Real integration and acceptance
 
-`tests/integration` targets an externally started disposable PokerTools 2.0.0
+`tests/integration` targets an externally started disposable released PokerTools 2.0.3
 deployment backed by real PostgreSQL and Redis. It starts the actual built NLHE
 process and a loopback OpenAI-compatible provider, and drives real SIWE wallets through the
 product's own room orchestration. `tests/browser` drives the real public UI with
@@ -107,6 +107,50 @@ following hold:
 
 ## Live provider acceptance
 
+### Focused external-release staging gate
+
+The disposable container gate is separate from the full roster matrix. It uses
+an external operator fixture pinned to released PokerTools 2.0.3; no platform source is
+embedded in NLHE. The fixture must expose independently supervised Anvil, two
+quorum processes, workers and custody, using their existing operational evidence
+rather than API-style HTTP checks for workers/custody.
+
+```bash
+docker build -t nlhe-product:container-gate .
+NLHE_IT_STAGING_FIXTURE=/absolute/path/to/staging-platform.mjs \
+NLHE_IT_SECRET_SCANNER=/absolute/path/to/secret-check.mjs \
+  npx tsx tests/integration/container-gate.ts --full
+```
+
+Each run creates fresh PostgreSQL, Redis, chain fixtures and product SQLite.
+Use production rate-limit settings and the platform's production deal cadence
+(5000 ms, also used in the historical 2.0.0 baseline); accelerated fixture hands
+can generate an artificial load.
+The product's sidecar connects directly over the staging network, keeping its
+real source address distinct from host-native operator/human requests. No
+forwarded-IP spoofing or rate-limit exemptions are used.
+Full mode cannot skip the browser or final secret scan. It requires same-room
+human/agent canonical actions, session/socket recovery, terminal state, two
+active-room restarts, readiness outage/recovery without a product restart,
+zero platform HTTP 429 counters, independent child supervision and cleanup.
+Only a complete successful run emits `DETERMINISTIC_STAGING=PASS`. Its summary
+must retain actual platform version, configured image, image ID and registry
+digest (when available), plus the product image and image ID. Paid wrappers
+must compare actual platform artifact identity, not just a gate run ID or PASS
+flag. Historical summaries without provenance do not authorize a new paid run.
+For paid eligibility, supply `NLHE_IT_TERMINAL_FOLD_SUMMARY` with the focused
+terminal-FOLD summary. The full gate binds accepted FOLD, durable completion,
+archive, director/continuation, terminal room, zero-429 and clean-scan evidence
+to its actual platform and product artifacts. Without that proof the full gate
+is not a paid authorization.
+Readiness-only and `--self-test` are development checks, not release evidence.
+Runtime env files and secret manifests stay outside captured artifacts and are
+removed during teardown; captured logs are redacted before writing.
+
+Paid runs remain prohibited until this full deterministic gate passes. The
+live financial assertion also counts sealed, balanced entry/reserve/settlement
+journals and compares the same evidence across the settlement restart.
+
 Live acceptance is explicit opt-in and paid:
 
 ```bash
@@ -128,7 +172,7 @@ run. Do not present a smoke or live run as platform financial acceptance.
 
 ## Docker build
 
-The product image installs SDK/types `2.0.0` from npm through `npm ci`; no local
+The product image installs SDK/types `2.0.3` from npm through `npm ci`; no local
 platform build is needed (see [OPERATIONS.md](OPERATIONS.md)):
 
 ```bash

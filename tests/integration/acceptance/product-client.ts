@@ -13,11 +13,27 @@ export class ProductApiError extends Error {
     readonly status: number,
     readonly code: string,
     message: string,
-    readonly body: unknown
+    readonly body: unknown,
+    /** Parsed `retry-after` response header, if the server sent one. */
+    readonly retryAfterMs: number | null = null
   ) {
     super(message);
     this.name = 'ProductApiError';
   }
+}
+
+/**
+ * Parse an HTTP `retry-after` value into milliseconds. Accepts delay-seconds
+ * and HTTP-date forms; returns null when the header is absent or invalid.
+ */
+export function parseRetryAfterHeader(value: string | null): number | null {
+  if (value === null) return null;
+  const trimmed = value.trim();
+  if (trimmed === '') return null;
+  if (/^\d+$/.test(trimmed)) return Number.parseInt(trimmed, 10) * 1000;
+  const date = Date.parse(trimmed);
+  if (Number.isNaN(date)) return null;
+  return Math.max(0, date - Date.now());
 }
 
 export interface ProductRoomView {
@@ -119,7 +135,8 @@ export class ProductClient {
         response.status,
         typeof record.code === 'string' ? record.code : typeof record.error === 'string' ? record.error : `HTTP_${response.status}`,
         typeof record.message === 'string' ? record.message : `HTTP ${response.status}`,
-        payload
+        payload,
+        parseRetryAfterHeader(response.headers.get('retry-after'))
       );
     }
     return payload as T;

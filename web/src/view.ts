@@ -453,7 +453,10 @@ function renderRoomList(state: AppState): void {
 }
 
 function roomRow(room: RoomSummary): HTMLElement {
-  const row = el('div', { className: 'room-row' }, [
+  const row = el('div', {
+    className: 'room-row',
+    dataset: { testid: 'room-row', roomId: room.id, roomName: room.name },
+  }, [
     el('div', { className: 'room-row-main' }, [
       el('div', { className: 'room-row-title' }, [
         el('span', { text: room.name }),
@@ -471,16 +474,19 @@ function roomRow(room: RoomSummary): HTMLElement {
       el('button', {
         className: 'btn ghost small',
         text: 'Open',
+        dataset: { testid: 'room-open' },
         on: { click: () => actions.openRoom(room.id) },
       }),
       el('button', {
         className: 'btn ghost small',
         text: 'Join',
+        dataset: { testid: 'room-join' },
         on: { click: () => actions.joinRoom(room.id) },
       }),
       el('button', {
         className: 'btn primary small',
         text: 'Start',
+        dataset: { testid: 'room-start' },
         on: { click: () => actions.startRoom(room.id) },
       }),
     ]),
@@ -761,6 +767,7 @@ function renderTable(state: AppState): void {
   if (!visible || !tableId) return;
 
   setText(els.tableConnection, `ws: ${state.socketStatus}${state.socketDetail ? ` · ${state.socketDetail}` : ''}`);
+  els.tableConnection.dataset.socketStatus = state.socketStatus;
   els.tableConnection.className = `chip ${state.socketStatus === 'connected' ? 'good' : state.socketStatus === 'reconnecting' ? 'warn' : ''}`;
   setText(els.tableVersion, `v${state.observation?.version ?? '—'}`);
 

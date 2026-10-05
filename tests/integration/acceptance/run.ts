@@ -153,8 +153,9 @@ export async function runAcceptance(options: AcceptanceOptions): Promise<number>
     await report.check('browser: real public UI path with injected wallet (no routed fake API/WS)', async () => {
       const result = await runBrowserChecks({
         context,
-        productBaseUrl: nlhe.baseUrl,
+        productBaseUrl: nlhe!.baseUrl,
         platformBaseUrl: environment.platform.baseUrl,
+        getRoomEvidence: (roomId) => readRoomEvidence(productDatabasePath, roomId),
       });
       if (result.code !== 0) {
         throw new Error(`browser acceptance checks failed: ${result.failures.join(' | ')}`);
