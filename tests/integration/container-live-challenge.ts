@@ -112,6 +112,7 @@ import {
   type StagingPlatformFinance,
   type StagingTopology,
 } from './infra/staging.js';
+import type { ReleasedProcessUnit } from './infra/supervisor.js';
 import {
   assertExpectedPlatformArtifact,
   assertPlatformArtifactMatches,
@@ -857,6 +858,7 @@ async function main(): Promise<number> {
   let retainedFromSuccess = false;
   let rawSqliteDisposition: 'none' | 'private-runtime' | 'private-runtime-removed' = 'none';
   let runtimeStopProven = false;
+  let releasedProcessUnits: ReleasedProcessUnit[] = [];
   const sanitize = (value: unknown): string =>
     redact(typeof value === 'string' ? value : String(value)).replace(/[\r\n]+/g, ' ').slice(0, 2_000);
   const sanitizeList = (values: readonly string[]): string[] => values.slice(0, 10).map((value) => sanitize(value));
@@ -1207,6 +1209,20 @@ async function main(): Promise<number> {
     cleanupFailure = cleanupFailure ?? teardownErrors.join(' | ');
   }
 
+  // ---- Retained-finalization ownership: after every evidence capture, dispose
+  // ONLY the local supervised process fixtures (Anvil/quorum TCP proxies) whose
+  // piped stdio would otherwise pin this orchestrator's event loop forever.
+  // Containers, volumes, the runtime dir, the secret manifest and the private
+  // product SQLite remain untouched for operator classification. ----
+  if (retainedTopology && topology !== null) {
+    try {
+      releasedProcessUnits = await topology.releaseRetainedProcesses();
+    } catch (error) {
+      teardownErrors.push(`retained process release: ${sanitize(safeError(error))}`);
+      cleanupFailure = cleanupFailure ?? teardownErrors.join(' | ');
+    }
+  }
+
   // ---- Final status: any failure, teardown error or non-pass scan is FAIL. ----
   if (failure === null && cleanupFailure !== null) failure = cleanupFailure;
   const retainedState =
@@ -1227,7 +1243,8 @@ async function main(): Promise<number> {
           packetPath: failurePacket?.packetPath ?? null,
           runtimeStopProven,
           rawSqliteDisposition,
-          note: 'topology.stop() and private runtime cleanup were intentionally skipped; PostgreSQL/Redis/workers and the private runtime SQLite (outside captured artifacts) remain for operator classification',
+          releasedProcessUnits,
+          note: 'topology.stop() and private runtime cleanup were intentionally skipped; PostgreSQL/Redis/workers and the private runtime SQLite (outside captured artifacts) remain for operator classification; local supervised process fixtures were explicitly released so the harness exits naturally',
         }
       : null;
   const paidCallsConsumed =
@@ -1284,6 +1301,7 @@ async function main(): Promise<number> {
     retainedState,
     rawSqliteDisposition,
     runtimeStopProven,
+    releasedProcessUnits,
     paidCallsConsumed,
     infraRetryEligible: status === 'FAILED' && !paidCallsConsumed,
     error: failure,

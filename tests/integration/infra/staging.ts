@@ -35,6 +35,7 @@ import { generateSyntheticSecret, SecretRegistry } from './secret-registry.js';
 import {
   startContainerUnit,
   Supervisor,
+  type ReleasedProcessUnit,
   type UnitDescriptor,
   type UnitKind,
 } from './supervisor.js';
@@ -233,6 +234,14 @@ export interface StagingTopology {
   /** Register a product-authorized credential (redacted; child-allowed). */
   addProductSecret(label: string, value: string): void;
   assertHealthy(stage: string, options?: { requireCustodyHeartbeat?: boolean }): Promise<void>;
+  /**
+   * Retained-diagnostics finalization: explicitly release supervised LOCAL
+   * PROCESS units (fixture children such as Anvil/quorum TCP proxies) so the
+   * orchestrator exits naturally, while every container unit, volume, runtime
+   * dir, secret manifest and the private product SQLite stays intact for
+   * operator classification. Never throws; bounded per-unit results.
+   */
+  releaseRetainedProcesses(): Promise<ReleasedProcessUnit[]>;
   stop(): Promise<string[]>;
 }
 
@@ -531,6 +540,22 @@ export async function startStagingTopology(options: StagingTopologyOptions): Pro
             120_000
           );
         }
+      },
+      async releaseRetainedProcesses() {
+        // Retained-finalization ownership: dispose ONLY the local supervised
+        // process fixtures (their piped stdio can pin this orchestrator's event
+        // loop forever once `stop()` is deliberately skipped). Containers,
+        // volumes, the runtime dir, the secret manifest and the private product
+        // SQLite are never touched here.
+        const released = await supervisor.releaseProcessUnits();
+        for (const unit of released) {
+          context.log(
+            `retained process release: ${unit.name} pid=${unit.pid ?? 'none'} released=${String(
+              unit.released
+            )}${unit.reason ? ` (${unit.reason})` : ''}`
+          );
+        }
+        return released;
       },
       async stop() {
         const errors: string[] = [];

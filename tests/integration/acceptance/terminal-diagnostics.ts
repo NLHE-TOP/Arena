@@ -2176,6 +2176,118 @@ export function deriveTerminalDiagnosticsContract(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Authoritative terminal transition (anchor correlation, never a late action)
+// ---------------------------------------------------------------------------
+
+/**
+ * Product/platform terminal authority from ALREADY SANITIZED evidence. Only the
+ * exact authoritative markers count: the product room reached COMPLETE, the
+ * platform table is CLOSED, the competition is FINISHED with the canonical
+ * `settlementReady` predicate true, and the tournament/director progressed
+ * terminally. A conflict observed while any of this is false is NOT benign.
+ */
+export interface TerminalRoomAuthority {
+  roomStatus: string | null;
+  tableStatus: string | null;
+  competitionStatus: string | null;
+  settlementReady: boolean | null;
+  tournamentStatus: string | null;
+}
+
+export function isAuthoritativeTerminalRoom(input: TerminalRoomAuthority): boolean {
+  return (
+    input.roomStatus === 'COMPLETE' &&
+    input.tableStatus === 'CLOSED' &&
+    input.competitionStatus === 'FINISHED' &&
+    input.settlementReady === true &&
+    (input.tournamentStatus === 'FINISHED' || input.competitionStatus === 'FINISHED')
+  );
+}
+
+/**
+ * The hand that owns the authoritative terminal state: the LAST durable
+ * HAND_COMPLETED event's hand. A later human action's stale/own hand reference
+ * never overrides it, and no local poker semantics are inferred beyond the
+ * platform's own committed HAND_COMPLETED event.
+ */
+export function terminalCompletedHandId(
+  events: readonly TerminalDiagnosticsEvent[]
+): string | null {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!;
+    if (event.type === 'HAND_COMPLETED' && event.handId !== null) return event.handId;
+  }
+  return null;
+}
+
+export type TerminalTransitionEvidenceError =
+  | 'capture-failed'
+  | 'table-missing'
+  | 'snapshot-missing'
+  | 'hand-missing'
+  | 'hand-completed-missing'
+  | 'hand-history-missing'
+  | 'outbox-empty'
+  | 'job-state-unreadable'
+  | 'competition-missing'
+  | 'tournament-missing'
+  | 'settlement-ready-missing'
+  | 'settlement-not-ready'
+  | 'competition-not-terminal'
+  | 'financial-settlement-not-settled';
+
+export interface TerminalTransitionEvidence {
+  pass: boolean;
+  reasons: TerminalTransitionEvidenceError[];
+}
+
+/**
+ * Strict terminal-transition evidence over the COMPLETED-HAND bundle. This is
+ * the additional gate used when a terminal room's latest human action was a
+ * benign post-terminal rejection: the completed hand itself must carry the
+ * durable HAND_COMPLETED / HandHistory / outbox / readable-job evidence, the
+ * competition and tournament must be terminally settled, and a CHALLENGE ASSET
+ * competition must carry a settled financial disposition (PAID/RELEASED). It
+ * never replaces the existing per-identity completeness errors; both must pass.
+ */
+export function assessCompletedHandTerminalEvidence(
+  bundle: TerminalDiagnosticsBundle
+): TerminalTransitionEvidence {
+  const contract = deriveTerminalDiagnosticsContract(bundle);
+  const reasons: TerminalTransitionEvidenceError[] = [];
+  if (contract.capture === 'failed') reasons.push('capture-failed');
+  if (contract.table === 'missing') reasons.push('table-missing');
+  if (contract.snapshot === 'missing') reasons.push('snapshot-missing');
+  if (contract.hand === 'missing') reasons.push('hand-missing');
+  if (contract.handCompleted !== 'present') reasons.push('hand-completed-missing');
+  if (contract.handHistory !== 'present') reasons.push('hand-history-missing');
+  if (contract.outbox !== 'present') reasons.push('outbox-empty');
+  if (contract.affectedHandJobs === 'missing') reasons.push('job-state-unreadable');
+  if (contract.competition === 'missing') reasons.push('competition-missing');
+  if (contract.tournament === 'missing') reasons.push('tournament-missing');
+  if (contract.settlementReady === 'missing') reasons.push('settlement-ready-missing');
+  const competition = bundle.competition;
+  if (competition === null || competition.settlementReady !== true) {
+    reasons.push('settlement-not-ready');
+  }
+  if (
+    competition !== null &&
+    !(competition.status === 'FINISHED' || bundle.tournament?.status === 'FINISHED')
+  ) {
+    reasons.push('competition-not-terminal');
+  }
+  if (
+    competition !== null &&
+    competition.mode === 'ASSET' &&
+    competition.prizeStatus !== 'PAID' &&
+    competition.prizeStatus !== 'RELEASED'
+  ) {
+    reasons.push('financial-settlement-not-settled');
+  }
+  return { pass: reasons.length === 0, reasons };
+}
+
 /**
  * Evaluate the mandatory durable packet for one bundle. Required identities
  * (table/snapshot/hand/competition/tournament/receipt) that are missing produce

@@ -548,6 +548,28 @@ describe('rejected human action evidence', () => {
     expect(lastCanonicalHumanActionFromBrowserResult({})).toBeNull();
     expect(lastCanonicalHumanActionFromBrowserResult({ canonicalHumanAction: { requestIds: [] } })).toBeNull();
   });
+
+  it('relays the metadata-only terminal conflict status from a browser canonical action', () => {
+    expect(
+      lastCanonicalHumanActionFromBrowserResult({
+        canonicalHumanAction: {
+          requestIds: ['req-late'],
+          requestId: 'req-late',
+          actionId: 'act-late',
+          turnId: 'turn-17',
+          status: 409,
+        },
+      })
+    ).toEqual({
+      requestIds: ['req-late'],
+      requestId: 'req-late',
+      actionId: 'act-late',
+      turnId: 'turn-17',
+      tableId: null,
+      handId: null,
+      httpStatus: 409,
+    });
+  });
 });
 
 describe('BullMQ job probe', () => {
@@ -1363,5 +1385,333 @@ describe('live wrapper finalization order', () => {
     expect(source).not.toContain('request_json');
     expect(source).not.toContain('response_json');
     expect(source).not.toContain('observation_json');
+  });
+});
+
+describe('terminal anchor correlation (post-terminal race)', () => {
+  const HAND = 'hand-1';
+  const LATE = 'req-late-race';
+
+  /** Terminal operator projection: CLOSED table, completed hand, settled competition. */
+  function terminalProjection(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    const base = {
+      table: {
+        id: TABLE,
+        status: 'CLOSED',
+        stateVersion: 9,
+        eventSeq: 12,
+        state: {
+          present: {
+            state: true,
+            handId: true,
+            handNumber: true,
+            street: true,
+            actionTo: true,
+            players: true,
+            winners: true,
+            pots: true,
+            currentBets: true,
+          },
+          handId: HAND,
+          handNumber: 1,
+          street: 'SHOWDOWN',
+          actionTo: null,
+          winners: [{ seat: 0, amount: 2000, handRank: 'One Pair' }],
+          players: [
+            {
+              id: 'player-1',
+              seat: 0,
+              status: 'ALL_IN',
+              stack: 2000,
+              betThisStreet: 0,
+              totalInvestedThisHand: 1000,
+              isSittingOut: false,
+            },
+          ],
+          currentBets: {},
+          pots: [],
+        },
+      },
+      events: [
+        {
+          id: 'ev-start',
+          eventSeq: 4,
+          type: 'HAND_STARTED',
+          version: 3,
+          turnId: null,
+          requestId: null,
+          actionId: null,
+          handId: HAND,
+          action: null,
+        },
+        {
+          id: 'ev-call',
+          eventSeq: 6,
+          type: 'ACTION_APPLIED',
+          version: 5,
+          turnId: `${TABLE}:${HAND}:4:1`,
+          requestId: 'req-committed-call',
+          actionId: `${TABLE}:${HAND}:4:1:CALL`,
+          handId: HAND,
+          action: 'CALL',
+        },
+        {
+          id: 'ev-done',
+          eventSeq: 7,
+          type: 'HAND_COMPLETED',
+          version: 5,
+          turnId: null,
+          requestId: null,
+          actionId: null,
+          handId: HAND,
+          action: null,
+        },
+      ],
+      subsequentHandStarts: [],
+      foldReceipt: null,
+      outbox: [
+        {
+          id: 'ob-archive',
+          kind: 'archive-hand',
+          status: 'COMPLETED',
+          attempts: 1,
+          dedupeKey: 'archive',
+          availableAt: '2026-01-01T00:00:00.000Z',
+          createdAt: '2026-01-01T00:00:00.000Z',
+          updatedAt: '2026-01-01T00:00:00.000Z',
+          lastError: null,
+          payload: { handId: HAND },
+        },
+      ],
+      handHistory: { exists: true, id: `${TABLE}_${HAND}`, timestamp: '2026-01-01T00:00:00.000Z' },
+      competition: {
+        id: COMPETITION,
+        mode: 'ASSET',
+        status: 'FINISHED',
+        startingStack: 1000,
+        smallBlind: 10,
+        bigBlind: 20,
+        entryAssetId: 'eip155:31337/erc20:0x0000000000000000000000000000000000000001',
+        entryAmountAtomic: '1',
+        prizeAssetId: 'eip155:31337/erc20:0x0000000000000000000000000000000000000001',
+        prizeAmountAtomic: '2',
+        prizeStatus: 'PAID',
+        tournamentId: 'tour-1',
+        settlementReady: true,
+        startedAt: null,
+        finishedAt: '2026-01-01T00:00:01.000Z',
+        cancelledAt: null,
+      },
+      tournament: {
+        id: 'tour-1',
+        status: 'FINISHED',
+        startingStack: 1000,
+        buyIn: 0,
+        fee: 0,
+        maxPlayers: 2,
+        tableId: TABLE,
+        startedAt: null,
+        finishedAt: '2026-01-01T00:00:01.000Z',
+      },
+      entrants: [],
+      reconciliation: null,
+    };
+    return { ...base, ...overrides };
+  }
+
+  /** Product DB whose room is authoritatively terminal with no human decision row. */
+  function terminalRoomDatabase(): { root: string; databasePath: string } {
+    const root = tempDir();
+    const databasePath = join(root, 'nlhe-live.sqlite');
+    createProductDatabase(databasePath);
+    const db = new Database(databasePath);
+    try {
+      db.prepare("UPDATE product_rooms SET status = 'COMPLETE'").run();
+      db.prepare('DELETE FROM product_model_attempts').run();
+      db.prepare('DELETE FROM product_decisions').run();
+    } finally {
+      db.close();
+    }
+    return { root, databasePath };
+  }
+
+  interface TerminalPacket {
+    terminal: {
+      authoritative: string;
+      durableComplete: boolean;
+      scopedIdentifiers: Record<string, unknown>;
+      actionAnchor: Record<string, unknown>;
+    };
+    humanAction: Record<string, unknown>;
+    warnings: string[];
+  }
+
+  async function collectTerminalPacket(options: {
+    root: string;
+    databasePath: string;
+    projection: Record<string, unknown>;
+    httpStatus?: number | null;
+    lateRequest?: string;
+    roomId?: string | null;
+  }): Promise<{ result: Awaited<ReturnType<typeof collectLiveFailurePacket>>; packet: TerminalPacket }> {
+    const result = await collectLiveFailurePacket({
+      context: { artifactDir: options.root, log: () => undefined },
+      adminTarget: { kind: 'url', databaseUrl: 'postgresql://unused' },
+      redisContainer: 'unused',
+      secretRegistry: { redact, values: () => [SECRET] },
+      productDatabasePath: options.databasePath,
+      lastCanonicalHumanAction: {
+        requestIds: [options.lateRequest ?? LATE],
+        handId: HAND,
+        turnId: `${TABLE}:${HAND}:17:none`,
+        httpStatus: options.httpStatus ?? 409,
+      },
+      roomId: options.roomId ?? null,
+      query: async () => JSON.stringify(options.projection),
+      now: () => new Date('2026-01-01T00:00:00.000Z'),
+    });
+    const packet = JSON.parse(readFileSync(result.packetPath!, 'utf8')) as TerminalPacket;
+    return { result, packet };
+  }
+
+  it('classifies a post-terminal 409 as BENIGN_POST_TERMINAL_RACE and keeps the packet complete', async () => {
+    const { root, databasePath } = terminalRoomDatabase();
+    const { result, packet } = await collectTerminalPacket({
+      root,
+      databasePath,
+      projection: terminalProjection(),
+    });
+    expect(result.complete).toBe(true);
+    expect(result.retainTopology).toBe(false);
+    expect(packet.terminal.durableComplete).toBe(true);
+    expect(packet.terminal.actionAnchor).toMatchObject({
+      classification: 'BENIGN_POST_TERMINAL_RACE',
+      lateRequestId: LATE,
+      httpStatus: 409,
+      lateRequestCommitted: false,
+      lateRequestBasis: 'receipt-absent',
+      terminalHandId: HAND,
+      anchorHandId: HAND,
+      reasons: [],
+    });
+    expect(packet.terminal.scopedIdentifiers).toMatchObject({
+      source: 'completed-terminal-hand',
+      requestId: null,
+      handId: HAND,
+      identityMismatch: false,
+    });
+    expect(packet.humanAction).toMatchObject({
+      requestIds: [LATE],
+      committed: false,
+      basis: 'receipt-absent',
+      receiptRequestId: null,
+      decisionRowAbsent: true,
+    });
+    expect(packet.warnings).toContain('benign-post-terminal-race');
+  });
+
+  it('keeps a 409 BEFORE the authoritative terminal state as an unresolved failure', async () => {
+    const { root, databasePath } = terminalRoomDatabase();
+    const { result, packet } = await collectTerminalPacket({
+      root,
+      databasePath,
+      projection: terminalProjection({
+        table: { ...(terminalProjection().table as Record<string, unknown>), status: 'ACTIVE' },
+        competition: {
+          ...(terminalProjection().competition as Record<string, unknown>),
+          status: 'RUNNING',
+          settlementReady: false,
+        },
+        tournament: { ...(terminalProjection().tournament as Record<string, unknown>), status: 'ACTIVE' },
+      }),
+    });
+    expect(result.complete).toBe(false);
+    expect(result.retainTopology).toBe(true);
+    expect(packet.terminal.durableComplete).toBe(false);
+    expect(packet.terminal.actionAnchor).toMatchObject({ classification: 'UNRESOLVED' });
+    expect(packet.warnings).not.toContain('benign-post-terminal-race');
+  });
+
+  it('never reclassifies a late request whose product row claims a committed receipt', async () => {
+    const { root, databasePath } = terminalRoomDatabase();
+    const db = new Database(databasePath);
+    try {
+      db.prepare(
+        `INSERT INTO product_decisions (id, table_id, turn_id, principal_id, room_id, status, observation_json, observation_hash, source_json, prompt_policy_id, event_cursor, request_json, receipt_json, error_reason, attempt_count, created_at, updated_at)
+         VALUES ('dec-late', ?, ?, 'human-player', 'room-1', 'COMMITTED', '{}', 'hash', NULL, 'policy-1', 12, ?, ?, NULL, 1, 3, 4)`
+      ).run(
+        TABLE,
+        `${TABLE}:${HAND}:17:none`,
+        JSON.stringify({ requestId: LATE, actionId: `${TABLE}:${HAND}:17:none:FOLD`, expectedVersion: 16 }),
+        JSON.stringify({ requestId: LATE, version: 17, eventSeq: 20 })
+      );
+    } finally {
+      db.close();
+    }
+    const { result, packet } = await collectTerminalPacket({
+      root,
+      databasePath,
+      projection: terminalProjection(),
+    });
+    expect(result.complete).toBe(false);
+    expect(result.retainTopology).toBe(true);
+    expect(packet.terminal.actionAnchor).toMatchObject({
+      classification: 'UNRESOLVED',
+      lateRequestCommitted: false,
+      lateRequestBasis: 'receipt-absent',
+    });
+    expect(packet.humanAction).toMatchObject({ decisionRowAbsent: false });
+    expect(packet.warnings).not.toContain('benign-post-terminal-race');
+  });
+
+  it('fails closed when the terminal hand is missing HAND_COMPLETED', async () => {
+    const { root, databasePath } = terminalRoomDatabase();
+    const { result, packet } = await collectTerminalPacket({
+      root,
+      databasePath,
+      projection: terminalProjection({
+        events: (terminalProjection().events as unknown[]).filter(
+          (event) => (event as { type?: unknown }).type !== 'HAND_COMPLETED'
+        ),
+      }),
+    });
+    expect(result.complete).toBe(false);
+    expect(result.retainTopology).toBe(true);
+    expect(packet.terminal.actionAnchor).toMatchObject({
+      classification: 'UNRESOLVED',
+      terminalHandId: null,
+    });
+  });
+
+  it('fails closed when the terminal durable outbox is incomplete', async () => {
+    const { root, databasePath } = terminalRoomDatabase();
+    const { result, packet } = await collectTerminalPacket({
+      root,
+      databasePath,
+      projection: terminalProjection({ outbox: [] }),
+    });
+    expect(result.complete).toBe(false);
+    expect(result.retainTopology).toBe(true);
+    expect(packet.terminal.actionAnchor.classification).toBe('UNRESOLVED');
+    expect(packet.terminal.actionAnchor.reasons).toContain('outbox-empty');
+    expect(packet.warnings).toContain('post-terminal-race-evidence-incomplete');
+    expect(packet.warnings).not.toContain('benign-post-terminal-race');
+  });
+
+  it('fails closed when the CHALLENGE financial settlement is incomplete', async () => {
+    const { root, databasePath } = terminalRoomDatabase();
+    const base = terminalProjection();
+    const { result, packet } = await collectTerminalPacket({
+      root,
+      databasePath,
+      projection: terminalProjection({
+        competition: { ...(base.competition as Record<string, unknown>), prizeStatus: 'RESERVED' },
+      }),
+    });
+    expect(result.complete).toBe(false);
+    expect(result.retainTopology).toBe(true);
+    expect(packet.terminal.actionAnchor.classification).toBe('UNRESOLVED');
+    expect(packet.terminal.actionAnchor.reasons).toContain('financial-settlement-not-settled');
+    expect(packet.warnings).not.toContain('benign-post-terminal-race');
   });
 });

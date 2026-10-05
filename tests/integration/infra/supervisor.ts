@@ -61,6 +61,15 @@ export interface UnexpectedDeath {
   evidence: string;
 }
 
+/** Bounded result of explicitly releasing one supervised local process unit. */
+export interface ReleasedProcessUnit {
+  name: string;
+  pid: number | null;
+  released: boolean;
+  /** `null` on a clean SIGTERM exit; a bounded category otherwise. */
+  reason: string | null;
+}
+
 export interface SupervisorOptions {
   log?: (message: string) => void;
   /** Redacts captured evidence; defaults to process.env credential values. */
@@ -602,6 +611,106 @@ export class Supervisor {
     if (!record) return;
     this.intentional.add(name);
     await record.descriptor.stop?.();
+  }
+
+  /**
+   * Explicitly dispose SUPERVISED PROCESS units (local fixture children such as
+   * Anvil and the quorum TCP proxies) WITHOUT touching CONTAINER or endpoint
+   * units. When evidence retention deliberately skips `dispose()`, the fixture
+   * children keep running and their piped stdio can pin the orchestrator's
+   * event loop forever; releasing them here lets the harness process exit
+   * naturally while every retained container/volume/private-SQLite artifact
+   * stays intact.
+   *
+   * Termination is PID-reuse safe: only the pid captured by the unit's own
+   * identity AND still matching its supervised start time is signalled. Never
+   * throws; bounded per-unit results let the caller record the release in the
+   * retained evidence. A child that ignores SIGTERM is escalated to SIGKILL
+   * (fixture disposal only, never the orchestrator process itself).
+   */
+  async releaseProcessUnits(timeoutMs = 10_000): Promise<ReleasedProcessUnit[]> {
+    const results: ReleasedProcessUnit[] = [];
+    this.stopMonitoring();
+    for (const name of [...this.order].reverse()) {
+      const record = this.records.get(name);
+      if (!record || record.descriptor.kind !== 'process') continue;
+      this.intentional.add(name);
+      this.failures.set(name, 0);
+      this.announced.delete(name);
+      let identity: UnitIdentity | null = record.identity;
+      try {
+        identity = await record.descriptor.identity();
+        record.identity = identity;
+      } catch {
+        // Keep the last known identity.
+      }
+      const pid = typeof identity?.pid === 'number' ? identity.pid : Number.NaN;
+      if (!Number.isInteger(pid) || pid <= 1) {
+        results.push({ name, pid: null, released: false, reason: 'no-supervised-pid' });
+        continue;
+      }
+      const expectedStart =
+        typeof identity?.startTime === 'string' && identity.startTime.length > 0
+          ? identity.startTime
+          : null;
+      const before = await processStartTime(pid);
+      if (before === null) {
+        results.push({ name, pid, released: true, reason: 'already-exited' });
+        continue;
+      }
+      if (expectedStart !== null && before !== expectedStart) {
+        results.push({ name, pid, released: false, reason: 'start-time-mismatch' });
+        continue;
+      }
+      try {
+        process.kill(pid, 'SIGTERM');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ESRCH') {
+          results.push({ name, pid, released: true, reason: 'already-exited' });
+          continue;
+        }
+        results.push({
+          name,
+          pid,
+          released: false,
+          reason: `signal-failed:${(error as NodeJS.ErrnoException).code ?? errorMessage(error)}`,
+        });
+        continue;
+      }
+      const deadline = Date.now() + Math.max(0, timeoutMs);
+      let exited = false;
+      while (Date.now() <= deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        if ((await processStartTime(pid)) === null) {
+          exited = true;
+          break;
+        }
+      }
+      let escalated = false;
+      if (!exited) {
+        try {
+          process.kill(pid, 'SIGKILL');
+          escalated = true;
+        } catch {
+          // Already gone.
+        }
+        const killDeadline = Date.now() + Math.min(5_000, Math.max(0, timeoutMs));
+        while (Date.now() <= killDeadline) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          if ((await processStartTime(pid)) === null) {
+            exited = true;
+            break;
+          }
+        }
+      }
+      results.push({
+        name,
+        pid,
+        released: exited,
+        reason: exited ? (escalated ? 'sigkill-escalated' : null) : 'still-alive-after-sigterm',
+      });
+    }
+    return results;
   }
 
   deaths(): readonly UnexpectedDeath[] {

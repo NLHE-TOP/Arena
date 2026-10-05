@@ -87,13 +87,17 @@ import { buildChildEnv } from '../infra/env-boundary.js';
 import { runCommand } from '../infra/proc.js';
 import type { RunContext } from '../infra/context.js';
 import {
+  assessCompletedHandTerminalEvidence,
   collectTerminalDiagnostics,
+  isAuthoritativeTerminalRoom,
   isTerminalDiagnosticComplete,
+  terminalCompletedHandId,
   terminalDiagnosticsQuery,
   type TerminalDiagnosticsBundle,
   type TerminalDiagnosticsIdentifiers,
   type TerminalDiagnosticsJobStateName,
   type TerminalDiagnosticsSqlQuery,
+  type TerminalTransitionEvidence,
 } from './terminal-diagnostics.js';
 
 /** Packet schema version; bump only for an incompatible field change. */
@@ -1030,6 +1034,11 @@ export function lastCanonicalHumanActionFromBrowserResult(result: unknown): Last
       turnId: typeof relayed.turnId === 'string' ? relayed.turnId : null,
       tableId: typeof relayed.tableId === 'string' ? relayed.tableId : null,
       handId: typeof relayed.handId === 'string' ? relayed.handId : null,
+      // Metadata-only terminal conflict status when the relay carries one; the
+      // absent case keeps the historical shape.
+      ...(typeof relayed.status === 'number' && Number.isInteger(relayed.status)
+        ? { httpStatus: relayed.status }
+        : {}),
     };
     if (canonicalHumanActionRequestIds(action).length > 0) return action;
   }
@@ -1134,11 +1143,81 @@ export function classifyHumanActionCommit(input: {
   return { committed: false, basis: 'receipt-absent' };
 }
 
+/**
+ * Classification of the canonical human action identity used as the packet's
+ * terminal evidence anchor. `BENIGN_POST_TERMINAL_RACE` is the ONLY case where
+ * an uncommitted late request does not require a receipt: the room/platform is
+ * already authoritative terminal, the exchange carried the expected terminal
+ * conflict (HTTP 404/409), the request left no committed receipt, and the
+ * actual completed hand carries complete durable terminal evidence.
+ */
+export type TerminalActionAnchorClassification =
+  | 'CANONICAL_COMMITTED'
+  | 'BENIGN_POST_TERMINAL_RACE'
+  | 'UNRESOLVED';
+
+export interface TerminalActionAnchor {
+  classification: TerminalActionAnchorClassification;
+  /** Exact late canonical request id, when the callback supplied one. */
+  lateRequestId: string | null;
+  /** Metadata-only HTTP status of the late exchange. */
+  httpStatus: number | null;
+  lateRequestCommitted: boolean | null;
+  lateRequestBasis: HumanActionCommitBasis;
+  /** Completed hand that owns the authoritative terminal state. */
+  terminalHandId: string | null;
+  /** Hand actually used for the scoped durable recapture. */
+  anchorHandId: string | null;
+  /** Bounded reasons when a candidate benign race failed its strict evidence. */
+  reasons: string[];
+}
+
+/**
+ * Expected terminal conflict for a stale action that arrived after the
+ * authoritative terminal state: the platform's canonical 409 (state moved on /
+ * terminal) or 404 (table/room gone). Any other status (or no status) is not
+ * silently treated as a benign race.
+ */
+export function isExpectedTerminalActionConflict(httpStatus: number | null | undefined): boolean {
+  return httpStatus === 404 || httpStatus === 409;
+}
+
+export interface BenignTerminalRaceCandidateInput {
+  commit: HumanActionCommitVerdict;
+  expectedConflict: boolean;
+  /** `isAuthoritativeTerminalRoom` over the initial room-level evidence. */
+  terminalRoom: boolean;
+  terminalHandId: string | null;
+  /**
+   * True when the product decision row for the EXACT late request claims a
+   * committed action/receipt. A missing receipt for an action claimed as
+   * committed must never be reclassified benign.
+   */
+  claimsCommittedReceipt: boolean;
+}
+
+/**
+ * Pure candidate gate for a benign post-terminal race. All conditions are
+ * mandatory; anything else keeps the existing fail-closed anchor on the exact
+ * late request (receipt required, topology retained).
+ */
+export function isBenignPostTerminalRaceCandidate(
+  input: BenignTerminalRaceCandidateInput
+): boolean {
+  return (
+    input.commit.committed === false &&
+    input.expectedConflict &&
+    input.terminalRoom &&
+    input.terminalHandId !== null &&
+    !input.claimsCommittedReceipt
+  );
+}
+
 export interface ScopedFoldIdentifiers {
   requestId: string | null;
   handId: string | null;
   turnId: string | null;
-  source: 'canonical-human-action' | 'latest-accepted-fold' | 'none';
+  source: 'canonical-human-action' | 'latest-accepted-fold' | 'completed-terminal-hand' | 'none';
   /** True when an initial event with the exact provided request id was found. */
   eventMatched: boolean;
   /**
@@ -1644,16 +1723,74 @@ export async function collectLiveFailurePacket(
       ...(input.maxJobStateReads !== undefined ? { maxJobStateReads: input.maxJobStateReads } : {}),
     });
 
-    const scoped = callbackFailed
-      ? {
-          requestId: null,
-          handId: null,
-          turnId: null,
-          source: 'none' as const,
-          eventMatched: false,
-          identityMismatch: false,
-        }
-      : resolveScopedFoldIdentifiers(initial.events, effectiveAction);
+    // Exact late-request evidence BEFORE anchor selection: a product row that
+    // claims the action committed (or carries a receipt identity) must block
+    // any benign reclassification; a missing receipt for such a claim stays a
+    // failure.
+    const requestIds = canonicalHumanActionRequestIds(effectiveAction);
+    const lateRequestEvidence = humanActionDecisionEvidence(
+      metadata.decisions,
+      metadata.attempts,
+      requestIds
+    );
+    const lateRequestClaimsReceipt =
+      lateRequestEvidence.decision !== null &&
+      (lateRequestEvidence.decision.status === 'COMMITTED' ||
+        lateRequestEvidence.decision.receiptRequestId !== null ||
+        lateRequestEvidence.decision.receiptEventSeq !== null);
+    const preliminaryCommit = classifyHumanActionCommit({
+      requestIds,
+      capture: initial.collection.status === 'COMPLETE' ? 'COMPLETE' : 'FAILED',
+      events: initial.events,
+      receipt:
+        initial.foldReceipt === null
+          ? null
+          : { requestId: initial.foldReceipt.requestId, eventSeq: initial.foldReceipt.eventSeq },
+    });
+    const terminalRoom = isAuthoritativeTerminalRoom({
+      roomStatus: typeof room?.status === 'string' ? room.status : null,
+      tableStatus: initial.table?.status ?? null,
+      competitionStatus: initial.competition?.status ?? null,
+      settlementReady: initial.competition?.settlementReady ?? null,
+      tournamentStatus: initial.tournament?.status ?? null,
+    });
+    const terminalHandId = terminalCompletedHandId(initial.events);
+    const benignCandidate = isBenignPostTerminalRaceCandidate({
+      commit: preliminaryCommit,
+      expectedConflict: isExpectedTerminalActionConflict(effectiveAction?.httpStatus ?? null),
+      terminalRoom,
+      terminalHandId,
+      claimsCommittedReceipt: lateRequestClaimsReceipt,
+    });
+
+    // Terminal anchor correlation: the anchor is the accepted canonical
+    // transition/completed hand that owns the authoritative terminal state. A
+    // later rejected action never replaces it; only when all benign conditions
+    // hold is the scoped recapture anchored to the LAST durable HAND_COMPLETED
+    // hand instead of the exact late request.
+    let scoped: ScopedFoldIdentifiers;
+    if (callbackFailed) {
+      scoped = {
+        requestId: null,
+        handId: null,
+        turnId: null,
+        source: 'none' as const,
+        eventMatched: false,
+        identityMismatch: false,
+      };
+    } else if (benignCandidate) {
+      const handEvents = initial.events.filter((event) => event.handId === terminalHandId);
+      scoped = {
+        requestId: null,
+        handId: terminalHandId,
+        turnId: handEvents.at(-1)?.turnId ?? null,
+        source: 'completed-terminal-hand',
+        eventMatched: true,
+        identityMismatch: false,
+      };
+    } else {
+      scoped = resolveScopedFoldIdentifiers(initial.events, effectiveAction);
+    }
     if (callbackFailed) {
       notes.push('human-action-capture-failed');
     }
@@ -1662,9 +1799,9 @@ export async function collectLiveFailurePacket(
       // the inferred accepted FOLD separately from any canonical human action.
       identitySource = 'latest-accepted-fold';
     }
-    let scopedBundle: TerminalDiagnosticsBundle | null = null;
-    if (scoped.source !== 'none' && initial.collection.status === 'COMPLETE') {
-      scopedBundle = await collectTerminalDiagnostics({
+    const collectScopedBundle = async (): Promise<TerminalDiagnosticsBundle | null> => {
+      if (scoped.source === 'none' || initial.collection.status !== 'COMPLETE') return null;
+      return await collectTerminalDiagnostics({
         query: diagnosticsQuery,
         identifiers: scopedIdentifiers(room, scoped, roomId),
         knownSecrets,
@@ -1672,12 +1809,55 @@ export async function collectLiveFailurePacket(
         readJobState: reader.readJobState,
         ...(input.maxJobStateReads !== undefined ? { maxJobStateReads: input.maxJobStateReads } : {}),
       });
+    };
+    let scopedBundle = await collectScopedBundle();
+    let benignEvidence: TerminalTransitionEvidence | null = null;
+    if (benignCandidate && scopedBundle !== null) {
+      benignEvidence = assessCompletedHandTerminalEvidence(scopedBundle);
     }
+    const benignRace =
+      benignCandidate && benignEvidence !== null && benignEvidence.pass;
+    if (benignCandidate && !benignRace) {
+      // The completed hand does NOT carry complete durable terminal evidence:
+      // keep the existing fail-closed anchor on the exact late request (receipt
+      // required) and retain the topology; a genuine gap is never reclassified.
+      notes.push('post-terminal-race-evidence-incomplete');
+      scoped = resolveScopedFoldIdentifiers(initial.events, effectiveAction);
+      scopedBundle = await collectScopedBundle();
+    } else if (benignRace) {
+      notes.push('benign-post-terminal-race');
+    }
+    const actionAnchor: TerminalActionAnchor = {
+      classification: benignRace
+        ? 'BENIGN_POST_TERMINAL_RACE'
+        : callbackFailed
+          ? 'UNRESOLVED'
+          : preliminaryCommit.committed === true
+            ? 'CANONICAL_COMMITTED'
+            : 'UNRESOLVED',
+      lateRequestId: requestIds[0] ?? null,
+      httpStatus:
+        typeof effectiveAction?.httpStatus === 'number' &&
+        Number.isInteger(effectiveAction.httpStatus)
+          ? effectiveAction.httpStatus
+          : null,
+      lateRequestCommitted: preliminaryCommit.committed,
+      lateRequestBasis: preliminaryCommit.basis,
+      terminalHandId,
+      anchorHandId: scoped.handId,
+      reasons: benignRace
+        ? []
+        : benignCandidate && benignEvidence !== null
+          ? [...benignEvidence.reasons]
+          : [],
+    };
     const authoritative = scopedBundle ?? initial;
 
     let durableComplete = false;
     try {
-      durableComplete = isTerminalDiagnosticComplete(authoritative);
+      durableComplete =
+        isTerminalDiagnosticComplete(authoritative) &&
+        (!benignRace || (benignEvidence?.pass ?? false));
     } catch {
       durableComplete = false;
     }
@@ -1694,7 +1874,6 @@ export async function collectLiveFailurePacket(
       typeof room?.tableId === 'string' ? room.tableId : null
     );
 
-    const requestIds = canonicalHumanActionRequestIds(effectiveAction);
     const humanVerdict = classifyHumanActionCommit({
       requestIds,
       capture: authoritative.collection.status === 'COMPLETE' ? 'COMPLETE' : 'FAILED',
@@ -1718,12 +1897,9 @@ export async function collectLiveFailurePacket(
     // Explicit rejected/uncommitted evidence: the exact request row (status +
     // attempt states) or its absence, and the absent durable receipt. The
     // operator SQL foldReceipt JOIN only matches a committed FOLD event, so an
-    // uncommitted fold never fabricates a receipt.
-    const requestEvidence = humanActionDecisionEvidence(
-      metadata.decisions,
-      metadata.attempts,
-      requestIds
-    );
+    // uncommitted fold never fabricates a receipt. The row evidence was already
+    // read before anchor selection (it gates the benign-race classification).
+    const requestEvidence = lateRequestEvidence;
     const foldReceiptAbsent =
       authoritative.foldReceipt === null &&
       (requestIds.length > 0 || acceptedFoldRequestIds.length > 0);
@@ -1756,6 +1932,7 @@ export async function collectLiveFailurePacket(
       terminal: {
         authoritative: scopedBundle !== null ? 'scoped' : 'initial',
         scopedIdentifiers: scoped,
+        actionAnchor,
         initial,
         scoped: scopedBundle,
         durableComplete,

@@ -13,9 +13,11 @@ import { describe, expect, it } from 'vitest';
 import {
   OMITTED_DIAGNOSTIC_ERROR,
   TERMINAL_DIAGNOSTICS_ERROR_REGISTRY,
+  assessCompletedHandTerminalEvidence,
   collectTerminalDiagnostics,
   deriveTerminalDiagnosticsContract,
   deriveTerminalDiagnosticsWarnings,
+  isAuthoritativeTerminalRoom,
   isTerminalDiagnosticComplete,
   sanitizeDiagnosticError,
   sanitizeDiagnosticInput,
@@ -23,8 +25,10 @@ import {
   sanitizeOutboxPayload,
   sanitizeReconciliationPayload,
   sanitizeTerminalDiagnosticsSections,
+  terminalCompletedHandId,
   terminalDiagnosticCompleteness,
   terminalDiagnosticsSql,
+  type TerminalDiagnosticsBundle,
   type TerminalDiagnosticsSqlQuery,
 } from '../integration/acceptance/terminal-diagnostics.js';
 
@@ -1419,5 +1423,137 @@ describe('terminal diagnostics completeness contract', () => {
     expect(contract.affectedHandJobs).toBe('not-requested');
     expect(contract.settlementReady).toBe('present');
     expect(isTerminalDiagnosticComplete({ ...saved, contract, warnings: [], version: 1, collectedAt: T0, metrics: null, apiLogWarning: null })).toBe(true);
+  });
+});
+
+describe('authoritative terminal transition correlation', () => {
+  /** Terminal variant of the raw operator projection (completed hand). */
+  function terminalProjection(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    const base = rawOperatorProjection();
+    const competition = base.competition as Record<string, unknown>;
+    const tournament = base.tournament as Record<string, unknown>;
+    return {
+      ...base,
+      table: { ...(base.table as Record<string, unknown>), status: 'CLOSED' },
+      handHistory: { exists: true, id: `${TABLE}_${HAND}`, timestamp: T0 },
+      outbox: [
+        {
+          id: 'ob-archive',
+          kind: 'archive-hand',
+          status: 'COMPLETED',
+          attempts: 1,
+          dedupeKey: 'archive',
+          availableAt: T0,
+          createdAt: T0,
+          updatedAt: T0,
+          lastError: null,
+          payload: { handId: HAND },
+        },
+      ],
+      competition: {
+        ...competition,
+        mode: 'ASSET',
+        status: 'FINISHED',
+        settlementReady: true,
+        prizeStatus: 'PAID',
+      },
+      tournament: { ...tournament, status: 'FINISHED' },
+      ...overrides,
+    };
+  }
+
+  async function terminalBundle(
+    overrides: Record<string, unknown> = {}
+  ): Promise<TerminalDiagnosticsBundle> {
+    return await collectTerminalDiagnostics({
+      query: staticQuery(terminalProjection(overrides)).query,
+      identifiers: { tableId: TABLE, competitionId: COMPETITION, handId: HAND },
+    });
+  }
+
+  it('accepts only the exact authoritative terminal room markers', () => {
+    const authoritative = {
+      roomStatus: 'COMPLETE',
+      tableStatus: 'CLOSED',
+      competitionStatus: 'FINISHED',
+      settlementReady: true,
+      tournamentStatus: 'FINISHED',
+    };
+    expect(isAuthoritativeTerminalRoom(authoritative)).toBe(true);
+    expect(isAuthoritativeTerminalRoom({ ...authoritative, roomStatus: 'ACTIVE' })).toBe(false);
+    expect(isAuthoritativeTerminalRoom({ ...authoritative, roomStatus: 'FAILED' })).toBe(false);
+    expect(isAuthoritativeTerminalRoom({ ...authoritative, tableStatus: 'ACTIVE' })).toBe(false);
+    expect(isAuthoritativeTerminalRoom({ ...authoritative, competitionStatus: 'RUNNING' })).toBe(false);
+    expect(isAuthoritativeTerminalRoom({ ...authoritative, settlementReady: false })).toBe(false);
+    expect(isAuthoritativeTerminalRoom({ ...authoritative, settlementReady: null })).toBe(false);
+  });
+
+  it('anchors on the LAST durable HAND_COMPLETED hand, never a stale provided hand', () => {
+    const events = [
+      { id: 'e1', eventSeq: 1, type: 'HAND_COMPLETED', version: 1, turnId: null, requestId: null, actionId: null, handId: 'hand-1', action: null },
+      { id: 'e2', eventSeq: 2, type: 'HAND_STARTED', version: 2, turnId: null, requestId: null, actionId: null, handId: 'hand-2', action: null },
+      { id: 'e3', eventSeq: 3, type: 'HAND_COMPLETED', version: 3, turnId: null, requestId: null, actionId: null, handId: 'hand-2', action: null },
+    ];
+    expect(terminalCompletedHandId(events)).toBe('hand-2');
+    expect(terminalCompletedHandId([])).toBeNull();
+    expect(
+      terminalCompletedHandId([
+        { id: 'e1', eventSeq: 1, type: 'HAND_STARTED', version: 1, turnId: null, requestId: null, actionId: null, handId: 'hand-1', action: null },
+      ])
+    ).toBeNull();
+  });
+
+  it('passes strict terminal-transition evidence only for a durable completed hand', async () => {
+    const bundle = await terminalBundle();
+    expect(assessCompletedHandTerminalEvidence(bundle)).toEqual({ pass: true, reasons: [] });
+  });
+
+  it('fails closed when the completed hand lacks HAND_COMPLETED', async () => {
+    const bundle = await terminalBundle({
+      events: (rawOperatorProjection().events as unknown[]).filter(
+        (event) => (event as { type?: unknown }).type !== 'HAND_COMPLETED'
+      ),
+    });
+    const evidence = assessCompletedHandTerminalEvidence(bundle);
+    expect(evidence.pass).toBe(false);
+    expect(evidence.reasons).toContain('hand-completed-missing');
+  });
+
+  it('fails closed when the terminal durable outbox is empty', async () => {
+    const evidence = assessCompletedHandTerminalEvidence(await terminalBundle({ outbox: [] }));
+    expect(evidence.pass).toBe(false);
+    expect(evidence.reasons).toContain('outbox-empty');
+  });
+
+  it('fails closed when the competition is not terminally settled', async () => {
+    const base = terminalProjection();
+    const evidence = assessCompletedHandTerminalEvidence(
+      await terminalBundle({
+        competition: { ...(base.competition as Record<string, unknown>), settlementReady: false },
+      })
+    );
+    expect(evidence.pass).toBe(false);
+    expect(evidence.reasons).toContain('settlement-not-ready');
+  });
+
+  it('fails closed when a CHALLENGE ASSET financial settlement is incomplete', async () => {
+    const base = terminalProjection();
+    const evidence = assessCompletedHandTerminalEvidence(
+      await terminalBundle({
+        competition: { ...(base.competition as Record<string, unknown>), prizeStatus: 'RESERVED' },
+      })
+    );
+    expect(evidence.pass).toBe(false);
+    expect(evidence.reasons).toContain('financial-settlement-not-settled');
+  });
+
+  it('does not impose a financial disposition on a non-ASSET competition', async () => {
+    const base = terminalProjection();
+    const evidence = assessCompletedHandTerminalEvidence(
+      await terminalBundle({
+        competition: { ...(base.competition as Record<string, unknown>), mode: 'SPONSORED', prizeStatus: 'NONE' },
+      })
+    );
+    expect(evidence.pass).toBe(true);
   });
 });

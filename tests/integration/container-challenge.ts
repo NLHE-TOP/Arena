@@ -33,6 +33,12 @@
  *   across the ONE existing product restart (settlement/restart safety);
  * - zero platform HTTP 429 responses in the platform's own `/metrics` counter
  *   before/after the run and inside the shared scenario;
+ * - one deterministic post-terminal race regression on the SAME completed
+ *   CHALLENGE: a real server-issued pre-terminal legal action is submitted
+ *   after the room is authoritative terminal, the platform's canonical
+ *   stale/turn conflict (HTTP 409) is reproduced, and the durable failure
+ *   packet must anchor to the completed hand, classify the late request as
+ *   BENIGN_POST_TERMINAL_RACE and stay complete (durableComplete=true);
  * - every supervised unit alive with no unexpected death, and the mandatory
  *   final external secret scan over every captured log/artifact with the
  *   runtime secret manifest (there is no skip path).
@@ -59,7 +65,7 @@
  *                             (default: nlhe-product:container-gate)
  */
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ROOT, createRunContext, type RunContext } from './infra/context.js';
@@ -88,6 +94,11 @@ import type { PlatformHandle } from './infra/platform.js';
 import { ProductClient } from './acceptance/product-client.js';
 import { readRoomEvidence } from './acceptance/evidence.js';
 import { readPlatform429Total } from './acceptance/platform-metrics.js';
+import {
+  collectLiveFailurePacket,
+  isExpectedTerminalActionConflict,
+  type LastCanonicalHumanAction,
+} from './acceptance/live-failure-packet.js';
 import {
   LIVE_CHALLENGE_ENTRY_ATOMIC,
   LIVE_CHALLENGE_PRIZE_ATOMIC,
@@ -226,6 +237,68 @@ function summarizeRoomEvidence(databasePath: string, roomId: string): ChallengeR
   }
 }
 
+/** Bounded HTTP status of a canonical action rejection (SDK error shape). */
+export function actionRejectionStatus(error: unknown): number | null {
+  const record = error as { statusCode?: unknown; status?: unknown };
+  if (typeof record?.statusCode === 'number' && Number.isInteger(record.statusCode)) {
+    return record.statusCode;
+  }
+  if (typeof record?.status === 'number' && Number.isInteger(record.status)) {
+    return record.status;
+  }
+  return null;
+}
+
+/**
+ * One exact server-issued stale action captured BEFORE the room reached its
+ * authoritative terminal state. The late request reuses the platform's own
+ * turn/version/action identity; the harness never invents poker semantics.
+ */
+export interface StaleHumanActionCapture {
+  requestId: string;
+  tableId: string;
+  handId: string | null;
+  turnId: string;
+  expectedVersion: number;
+  actionId: string;
+}
+
+/**
+ * Choose the late action from a real server-issued legal menu (FOLD preferred,
+ * so the aggressive deterministic driver is unlikely to have submitted the same
+ * action identity). Returns null when the observation carries no exact
+ * turn/version/action identity.
+ */
+export function selectStaleAction(observation: {
+  turnId?: unknown;
+  version?: unknown;
+  handId?: unknown;
+  legalActions?: ReadonlyArray<{ actionId?: unknown; family?: unknown }>;
+}): { turnId: string; expectedVersion: number; actionId: string; handId: string | null } | null {
+  const turnId =
+    typeof observation.turnId === 'string' && observation.turnId.length > 0
+      ? observation.turnId
+      : null;
+  const expectedVersion =
+    typeof observation.version === 'number' && Number.isInteger(observation.version)
+      ? observation.version
+      : null;
+  const actions = Array.isArray(observation.legalActions) ? observation.legalActions : [];
+  const chosen =
+    actions.find((action) => action.family === 'FOLD' && typeof action.actionId === 'string') ??
+    actions.find((action) => typeof action.actionId === 'string');
+  if (turnId === null || expectedVersion === null || chosen === undefined) return null;
+  return {
+    turnId,
+    expectedVersion,
+    actionId: chosen.actionId as string,
+    handId:
+      typeof observation.handId === 'string' && observation.handId.length > 0
+        ? observation.handId
+        : null,
+  };
+}
+
 /**
  * Mandatory final scan after all teardown logs exist. The scanner child gets
  * only the system allowlist plus `NLHE_REPO` (the checkout root holding the
@@ -282,6 +355,7 @@ async function main(): Promise<number> {
         `  terms: entryAtomic=${LIVE_CHALLENGE_ENTRY_ATOMIC} prizeAtomic=${LIVE_CHALLENGE_PRIZE_ATOMIC}`,
         '  ordering: fresh deferred-custody topology -> public payer claim -> supervised API restart -> public sponsor claim -> declared sponsor classification -> actual custody worker/READY -> product /ready 200 -> CHALLENGE room',
         '  shared helper: runChallengeScenario with injected assertion caps (5000 calls / 0 microUsd / 600000 ms); the live default stays LIVE_CAPS 24 / 50000 / 120000',
+        '  post-terminal race regression: one real pre-terminal legal action is submitted after the authoritative terminal state (expect HTTP 409) and the durable packet must anchor to the completed hand with durableComplete=true and BENIGN_POST_TERMINAL_RACE',
         '  prerequisites: NLHE_IT_STAGING_FIXTURE, NLHE_IT_SECRET_SCANNER, NLHE_IT_PRODUCT_IMAGE built from current source; --check starts nothing',
       ].join('\n')
     );
@@ -310,6 +384,12 @@ async function main(): Promise<number> {
   const teardownErrors: string[] = [];
   let scan: 'pending' | 'pass' | 'failed' | 'unavailable' = 'pending';
   let cleanupFailure: string | null = null;
+  const staleCapture: { current: StaleHumanActionCapture | null } = { current: null };
+  let lateActionStatus: number | null = null;
+  let lateActionPacketComplete: boolean | null = null;
+  let lateActionDurableComplete: boolean | null = null;
+  let lateActionClassification: string | null = null;
+  let lateActionPacketPath: string | null = null;
   let redact: (text: string) => string = (text) => text;
   const sanitize = (value: unknown): string =>
     redact(typeof value === 'string' ? value : String(value)).replace(/[\r\n]+/g, ' ').slice(0, 2_000);
@@ -487,6 +567,36 @@ async function main(): Promise<number> {
       `deterministic challenge product bootstrap healthy at ${runtime.baseUrl} (container ${runtime.name}); /ready is deferred until actual custody READY`
     );
 
+    // ---- Post-terminal race regression fixture: a second session for the SAME
+    // human wallet records one REAL server-issued legal action while the room is
+    // active. It is submitted only AFTER the room is authoritative terminal, so
+    // the platform's canonical stale/turn conflict (HTTP 409) is reproduced
+    // deterministically with no invented poker semantics. ----
+    const observerSession = await loginWallet(started.platformUrl, getAccount(1));
+    let observing = true;
+    let observerStarted = false;
+    let observerLoop: Promise<void> = Promise.resolve();
+    const startObserver = (tableId: string): void => {
+      if (observerStarted) return;
+      observerStarted = true;
+      observerLoop = (async () => {
+        while (observing && staleCapture.current === null) {
+          try {
+            const observation = await observerSession.client.getObservation(tableId);
+            const selected = selectStaleAction(observation);
+            if (selected !== null) {
+              staleCapture.current = { requestId: randomUUID(), tableId, ...selected };
+            }
+          } catch {
+            // Observation races are retried until the room is terminal.
+          }
+          if (staleCapture.current === null) {
+            await new Promise((resolve) => setTimeout(resolve, 1_200));
+          }
+        }
+      })();
+    };
+
     outcome = await runChallengeScenario(
       {
         context,
@@ -504,9 +614,112 @@ async function main(): Promise<number> {
       {
         onProgress: (value) => {
           challengeProgress.current = value;
+          if (value.tableId !== null && value.status === 'ACTIVE') {
+            startObserver(value.tableId);
+          }
         },
       },
       DETERMINISTIC_CHALLENGE_ASSERTION_CAPS
+    );
+
+    // Stop observing BEFORE the late submission: the exact pre-terminal request
+    // identity is what a real driver would have retained across terminal.
+    observing = false;
+    await observerLoop.catch(() => undefined);
+    if (staleCapture.current === null) {
+      throw new Error(
+        'deterministic post-terminal race: no pre-terminal human observation was captured'
+      );
+    }
+    let lateRejection: unknown = null;
+    try {
+      await observerSession.client.action(staleCapture.current.tableId, {
+        requestId: staleCapture.current.requestId,
+        turnId: staleCapture.current.turnId,
+        expectedVersion: staleCapture.current.expectedVersion,
+        actionId: staleCapture.current.actionId,
+      });
+    } catch (error) {
+      lateRejection = error;
+    }
+    if (lateRejection === null) {
+      throw new Error(
+        'deterministic post-terminal race: the late canonical action was accepted instead of rejected'
+      );
+    }
+    lateActionStatus = actionRejectionStatus(lateRejection);
+    if (!isExpectedTerminalActionConflict(lateActionStatus)) {
+      throw new Error(
+        `deterministic post-terminal race: late canonical action status ${lateActionStatus ?? 'unknown'} is not the expected terminal conflict`
+      );
+    }
+    context.log(
+      `deterministic post-terminal race: late canonical action ${staleCapture.current.requestId} rejected with HTTP ${lateActionStatus}`
+    );
+    const lateActionIdentity: LastCanonicalHumanAction = {
+      requestIds: [staleCapture.current.requestId],
+      requestId: staleCapture.current.requestId,
+      actionId: staleCapture.current.actionId,
+      turnId: staleCapture.current.turnId,
+      tableId: staleCapture.current.tableId,
+      handId: staleCapture.current.handId,
+      httpStatus: lateActionStatus,
+    };
+    const lateActionPacket = await collectLiveFailurePacket({
+      context,
+      adminTarget: started.adminTarget,
+      redisContainer: started.redisContainer,
+      secretRegistry: started.secretRegistry,
+      productDatabasePath: databasePath,
+      platformMetrics: started.platformMetrics,
+      apiContainerName: finance.apiContainerName ?? null,
+      reason: 'deterministic post-terminal race classification',
+      lastCanonicalHumanAction: lateActionIdentity,
+      agentPrincipalIds: principals.map((principal) => principal.principalId),
+      roomId: outcome.roomId,
+    });
+    lateActionPacketComplete = lateActionPacket.complete;
+    lateActionPacketPath = lateActionPacket.packetPath;
+    if (!lateActionPacket.complete || lateActionPacket.retainTopology) {
+      throw new Error(
+        `deterministic post-terminal race: durable failure packet incomplete (${lateActionPacket.reason ?? 'no reason'})`
+      );
+    }
+    const lateActionPacketPayload = JSON.parse(readFileSync(lateActionPacket.packetPath!, 'utf8')) as {
+      terminal?: {
+        durableComplete?: unknown;
+        actionAnchor?: { classification?: unknown; reasons?: unknown };
+        scopedIdentifiers?: { source?: unknown; requestId?: unknown; handId?: unknown };
+      };
+      humanAction?: { committed?: unknown; basis?: unknown };
+    };
+    lateActionDurableComplete = lateActionPacketPayload.terminal?.durableComplete === true;
+    lateActionClassification =
+      typeof lateActionPacketPayload.terminal?.actionAnchor?.classification === 'string'
+        ? lateActionPacketPayload.terminal.actionAnchor.classification
+        : null;
+    if (!lateActionDurableComplete) {
+      throw new Error('deterministic post-terminal race: terminal.durableComplete != true');
+    }
+    if (lateActionClassification !== 'BENIGN_POST_TERMINAL_RACE') {
+      throw new Error(
+        `deterministic post-terminal race: classification ${lateActionClassification ?? 'missing'} != BENIGN_POST_TERMINAL_RACE`
+      );
+    }
+    if (lateActionPacketPayload.terminal?.scopedIdentifiers?.source !== 'completed-terminal-hand') {
+      throw new Error(
+        `deterministic post-terminal race: terminal anchor source ${String(
+          lateActionPacketPayload.terminal?.scopedIdentifiers?.source
+        )} != completed-terminal-hand`
+      );
+    }
+    if (lateActionPacketPayload.humanAction?.committed !== false) {
+      throw new Error('deterministic post-terminal race: the rejected late request was reported committed');
+    }
+    context.log(
+      `deterministic post-terminal race PASS: packetComplete=${lateActionPacketComplete} durableComplete=${lateActionDurableComplete} classification=${lateActionClassification} anchorHand=${String(
+        lateActionPacketPayload.terminal?.scopedIdentifiers?.handId
+      )}`
     );
 
     providerRequests =
@@ -622,6 +835,16 @@ async function main(): Promise<number> {
     restart: outcome?.restart ?? null,
     caps: DETERMINISTIC_CHALLENGE_CAPS,
     providerRequests,
+    postTerminalRace: {
+      requestId: staleCapture.current?.requestId ?? null,
+      handId: staleCapture.current?.handId ?? null,
+      turnId: staleCapture.current?.turnId ?? null,
+      httpStatus: lateActionStatus,
+      packetComplete: lateActionPacketComplete,
+      durableComplete: lateActionDurableComplete,
+      classification: lateActionClassification,
+      packetPath: lateActionPacketPath,
+    },
     platform429Before,
     platform429After,
     supervisedUnits,

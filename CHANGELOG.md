@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.3.1 — 2026-10-06
+
+Acceptance/evidence correlation and cleanup fix only; no NLHE
+gameplay/runtime/provider policy change. The released platform is unchanged
+(PokerTools 2.0.4, immutable digest
+`sha256:115beb096708048f98eb6271c65e6bb4f833c1dc03618cdc8bf3ce2a8f8b5469`) and
+the public SDK/types stay pinned to 2.0.3.
+
+- Terminal evidence correlation: the durable failure packet now anchors its
+  terminal diagnostics to the accepted canonical transition / completed hand
+  that owns the authoritative terminal state (the last durable
+  `HAND_COMPLETED` hand) instead of blindly scoping to the latest human action
+  request. A later rejected action can no longer replace that anchor.
+- Benign post-terminal races: a late human/browser action that the platform
+  correctly rejects with its canonical terminal conflict (HTTP 409/404) while
+  the room is authoritative terminal, has no committed receipt, and leaves the
+  completed hand with complete durable evidence (HAND_COMPLETED, HandHistory,
+  completed outbox work, terminal competition/tournament, `settlementReady`,
+  and a settled CHALLENGE prize) is classified `BENIGN_POST_TERMINAL_RACE` and
+  no longer turns an otherwise successful terminal run into a retained FAIL.
+  A conflict before the authoritative terminal state, a request whose product
+  row claims a committed receipt, a missing HAND_COMPLETED, incomplete durable
+  outbox work, or an incomplete CHALLENGE financial settlement still fail
+  closed and retain the topology.
+- Retained-diagnostics cleanup: after evidence finalization with a genuinely
+  retained topology, the harness explicitly releases its supervised local
+  process fixtures (Anvil and the quorum TCP proxies, whose piped stdio pinned
+  the orchestrator's event loop) so the wrapper exits naturally. Containers,
+  volumes, the runtime dir, the secret manifest and the private product SQLite
+  remain untouched for operator classification; no `process.exit`/self-SIGTERM
+  or timeout kill is used.
+- Deterministic regressions: the deterministic CHALLENGE runner now reproduces
+  the exact post-terminal race on a real completed challenge (real
+  server-issued pre-terminal action submitted after terminal, HTTP 409) and
+  requires the packet to stay complete with `durableComplete=true` and the
+  benign classification; focused unit regressions cover the benign positive and
+  all fail-closed negatives, plus a natural-exit probe for the retained
+  release path. No paid provider calls were made.
+
 ## 0.3.0 — 2026-10-05
 
 **User-visible**
